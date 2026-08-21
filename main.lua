@@ -35,6 +35,7 @@ return function(mod)
 
   local C = _G.__KANTO_INGAME or {}
   _G.__KANTO_INGAME = C
+  mod.exports = C
   if C.visible == nil then C.visible = true end    -- shown by default; O/F8 toggles it
   if C.resets == nil then C.resets = mod.save:get("resets", 0) end   -- persists across sessions
   C.fonts   = C.fonts or {}
@@ -251,7 +252,8 @@ return function(mod)
     local function countTrue(t) local n=0; if t then for _,v in pairs(t) do if v then n=n+1 end end end; return n end
     local dexTotal = 0
     for _, d in pairs(dPoke) do if d.dex and d.dex > dexTotal then dexTotal = d.dex end end
-    local splits = _G.__SOLO_SPLITS
+    local splitsMod = mod.find("solo_run_splits")
+    local splits = splitsMod and splitsMod.exports
     local champ = splits and splits.myTimes and splits.myTimes.CHAMPION
     if not champ and save.flags and save.flags.EVENT_BEAT_CHAMPION_RIVAL then
       champ = C.champTime or save.playTime
@@ -960,26 +962,17 @@ return function(mod)
   -- ---------------------------------------------------------------------
   -- Hooks into the game (won't double up if the mod reloads).
   -- ---------------------------------------------------------------------
-  if not C.wrappedUpdate and C.game and C.game.update then
-    C.origUpdate = C.game.update
-    C.game.update = function(self, dt)
-      C.origUpdate(self, dt)
-      local c = _G.__KANTO_INGAME; if c and c.onFrame then pcall(c.onFrame, dt) end
+  mod.hooks:wrap("core.update", function(nextFn, game, dt)
+    nextFn(game, dt)
+    if C.onFrame then pcall(C.onFrame, dt) end
+  end)
+  mod.hooks:wrap("render.hud", function(nextFn, game, viewport)
+    nextFn(game, viewport)
+    if C.drawOverlay then
+      local ok, err = pcall(C.drawOverlay)
+      if not ok and err ~= C.drawErr then C.drawErr = err; mod.log:error("kanto_ingame draw: %s", tostring(err)) end
     end
-    C.wrappedUpdate = true
-  end
-  if not C.wrappedDraw then
-    C.origDraw = love.draw
-    love.draw = function(...)
-      if C.origDraw then C.origDraw(...) end
-      local c = _G.__KANTO_INGAME
-      if c and c.drawOverlay then
-        local ok, err = pcall(c.drawOverlay)
-        if not ok and err ~= c.drawErr then c.drawErr = err; mod.log:error("kanto_ingame draw: %s", tostring(err)) end
-      end
-    end
-    C.wrappedDraw = true
-  end
+  end)
   -- Key handling. Reassigned every load so F5 reload picks up changes.
   C.onKeyDown = function(_, key)
     local c = _G.__KANTO_INGAME
@@ -997,14 +990,19 @@ return function(mod)
     end
     return false
   end
-  if not C.wrappedKeys and C.game and C.game.keypressed then
-    C.origKeypressed = C.game.keypressed
-    C.game.keypressed = function(self, key, ...)
-      local c = _G.__KANTO_INGAME
-      if c and c.onKeyDown and c.onKeyDown(self, key) then return end
-      return C.origKeypressed(self, key, ...)
+  local GameModule = req("src.core.Game")
+  if GameModule and GameModule.keypressed then
+    local slot = GameModule.__soloOverlayKeys
+    if not slot then
+      slot = {}
+      GameModule.__soloOverlayKeys = slot
+      local origKeypressed = GameModule.keypressed
+      GameModule.keypressed = function(self, key, ...)
+        if slot.onKeyDown and slot.onKeyDown(self, key) then return end
+        return origKeypressed(self, key, ...)
+      end
     end
-    C.wrappedKeys = true
+    slot.onKeyDown = C.onKeyDown
   end
   mod.log:info("solo_run_overlay: overlay=o/f8  resets=[, ], \\")
 end
