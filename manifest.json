@@ -1,7 +1,7 @@
 {
   "id": "solo_run_overlay",
   "name": "Solo Overlay",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "entry": "main.lua",
   "api": 2,
   "profile": "content",

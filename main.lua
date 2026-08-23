@@ -6,14 +6,24 @@ return function(mod)
   -- way around it.
   --
   -- This is an overlay designed solely for solo running. It shows game time,
-  -- resets, your Pokemon's moves, stats, growth rate, ability, experience,
-  -- and more. It also shows enemy moves and stats. Both sets of stats update
-  -- in real time to show stat changes, burn debuffs, badge boost glitch
-  -- effects, etc.
+  -- resets, your Pokemon's moves, stats, growth rate, experience, and more.
+  -- It also shows enemy stats. Both sets of stats update in real time to
+  -- show stat changes, burn debuffs, badge boost glitch effects, etc.
+  --
+  -- Everything is drawn solid black with white outlines so it sits under the
+  -- game's own battle boxes without fighting them. Types, statuses and the
+  -- speed indicator are icons rather than text.
   --
   -- Move power is shown already multiplied out: the same-type bonus and the
   -- type matchup are baked into the number, rounded down at each step the
-  -- way the real game does it. The star and the multiplier show why.
+  -- way the real game does it. The star marks the same-type bonus.
+  --
+  -- Your Pokemon's HP is a live number with a coloured dot beside it, since
+  -- the game's own HUD already draws the bar. Green is full, yellow is hurt,
+  -- red is 24% or less.
+  --
+  -- The speed arrow reads the same adjusted stats the SPD boxes show, so
+  -- paralysis, stat stages and badge boosts are all accounted for.
   --
   -- Game time stops for good once the Champion is beaten, so the final time
   -- stays on screen for the end of a recording.
@@ -40,8 +50,6 @@ return function(mod)
   if C.resets == nil then C.resets = mod.save:get("resets", 0) end   -- persists across sessions
   C.fonts   = C.fonts or {}
   C.sprites = C.sprites or {}
-  C.dispHP  = C.dispHP or {}      -- animated HP values keyed by "p1".."p6"/"enemy"
-  C.dispSp  = C.dispSp or {}      -- species behind each animated value (reset on change)
 
   -- engine modules (same sources the streaming mod uses)
   local function req(p) local ok, m = pcall(require, p); return ok and m or nil end
@@ -63,27 +71,25 @@ return function(mod)
     return { tonumber(s:sub(1,2),16)/255, tonumber(s:sub(3,4),16)/255, tonumber(s:sub(5,6),16)/255 }
   end
   local COL = {
-    panel = hex("10121a"), border = hex("ffffff"),
-    text = hex("ffffff"), dim = hex("b9bdc9"),
-    hi = hex("7dd87d"), mid = hex("e6d24a"), lo = hex("e05a5a"),
-    xp = hex("5ab0ff"), gold = hex("ffd54a"), money = hex("ffe27a"),
-    barbg = hex("ffffff"), threat = hex("ffb38a"),
-    super = hex("7dd87d"), resist = hex("e0906a"),
-  }
-  local TYPE = {
-    NORMAL=hex("9a9a80"), FIRE=hex("e0632c"), WATER=hex("3a86e8"), ELECTRIC=hex("e0b330"),
-    GRASS=hex("5fb04a"), ICE=hex("5fc7c7"), FIGHTING=hex("b23a2e"), POISON=hex("8a3a9a"),
-    GROUND=hex("c8a84a"), FLYING=hex("7a8fe0"), PSYCHIC=hex("e0508a"), BUG=hex("8a9a20"),
-    ROCK=hex("a89440"), GHOST=hex("5a4a8a"), DRAGON=hex("5a4ae0"),
+    panel = hex("000000"), sub = hex("141414"), plate = hex("1c1c1c"),
+    border = hex("ffffff"), text = hex("ffffff"), dim = hex("b9bdc9"),
+    xp = hex("5ab0ff"), gold = hex("ffd54a"), outline = hex("000000"),
+    bestFill = hex("264a2c"), bestLine = hex("6ed278"),
+    hpFull = hex("3cd25a"), hpHurt = hex("f5d232"), hpLow = hex("eb3c3c"),
   }
 
   -- ---------------------------------------------------------------------
   -- Cheap caches: scaled fonts + species sprites
   -- ---------------------------------------------------------------------
+  local FONT_PATH = mod.assets:path("assets/fonts/verdanab.ttf")
   local function getFont(sizePx)
     sizePx = math.max(8, math.floor(sizePx))
     local f = C.fonts[sizePx]
-    if not f then f = love.graphics.newFont(sizePx); C.fonts[sizePx] = f end
+    if not f then
+      local ok, nf = pcall(love.graphics.newFont, FONT_PATH, sizePx)
+      if not ok then nf = love.graphics.newFont(sizePx) end
+      f = nf; C.fonts[sizePx] = f
+    end
     return f
   end
   -- Making sure battle sprites get colored the correct way and not be greyscale.
@@ -128,7 +134,7 @@ return function(mod)
     C.sprites[cacheKey] = img
     return img or nil
   end
-  -- Separate cache for this mod's own icons (badges, bag icons).
+  -- Separate cache for this mod's own icons (badges, bag, types, statuses, speed).
   C.uiImages = C.uiImages or {}
   local function uiImage(path)
     if C.uiImages[path] ~= nil then return C.uiImages[path] or nil end
@@ -136,6 +142,13 @@ return function(mod)
     C.uiImages[path] = ok and img or false
     return C.uiImages[path] or nil
   end
+  local function typeIconImg(t)
+    if not t then return nil end
+    return uiImage(mod.assets:path("assets/types/" .. tostring(t):lower() .. ".png"))
+  end
+  local STATUS_ICON = {
+    SLP = "sleep", PAR = "paralysis", BRN = "burn", FRZ = "freeze", PSN = "poison",
+  }
 
   -- ---------------------------------------------------------------------
   -- Reads the save data into something easy to draw.
@@ -148,7 +161,6 @@ return function(mod)
     end
     return nil
   end
-
   local function buildState()
     local game = C.game
     local save = game and game.save
@@ -230,7 +242,6 @@ return function(mod)
         types = dispTypes(raw), moves = moves, exp = mon.exp,
         xpProgress = xpProg, xpToNext = xpNext,
         growthRate = def and def.growthRate,
-        ability = def and def.ability,
         stats = mon.stats,
         badgeStat = playerBadgeStat,
         baseSpeed = def and def.baseStats and def.baseStats.speed,
@@ -308,9 +319,7 @@ return function(mod)
                 mult = mult, stab = has(enTypes, md.type) or nil, status = st2 or nil }
             end
           end
-          local mS, eS = pMon.stats and pMon.stats.speed, eMon.stats and eMon.stats.speed
-          local faster; if mS and eS then faster = (mS>eS) and "you" or ((eS>mS) and "them" or "tie") end
-          return { speed = { faster = faster }, myMoves = myMoves, enemyMoves = enemyMoves }
+          return { myMoves = myMoves, enemyMoves = enemyMoves }
         end)
         if ok then matchup = res end
       end
@@ -348,6 +357,46 @@ return function(mod)
       end
     end
 
+    -- One place decides what a stat reads, so the SPD boxes and the speed
+    -- arrow can never disagree with each other.
+    local STAT_KEYS = { "attack", "defense", "special", "speed" }
+    local function shownStats(e)
+      local base = e.stats or {}
+      local stages = e.stages or {}
+      local badge = e.badgeStat or {}
+      local live = e.liveStats
+      local pen = e.status and C.Status and C.Status.RECORDS
+        and C.Status.RECORDS[e.status] and C.Status.RECORDS[e.status].statPenalty
+      local out = { hp = base.hp }
+      for _, k in ipairs(STAT_KEYS) do
+        local v
+        if live and live[k] ~= nil then
+          v = live[k]
+        else
+          v = base[k]
+          if v then
+            local stg = stages[k]
+            if stg and stg ~= 0 and C.Stats and C.Stats.applyStage then
+              v = C.Stats.applyStage(v, stg)
+            end
+            if badge[k] then v = math.floor(v * 9 / 8) end
+            if pen and pen.stat == k then v = math.max(1, math.floor(v / pen.div)) end
+          end
+        end
+        out[k] = v
+      end
+      return out
+    end
+    if party[1] then party[1].shown = shownStats(party[1]) end
+    if battleBlock and battleBlock.enemy then
+      battleBlock.enemy.shown = shownStats(battleBlock.enemy)
+      local mS = party[1] and party[1].shown and party[1].shown.speed
+      local eS = battleBlock.enemy.shown.speed
+      if mS and eS then
+        battleBlock.faster = (mS > eS) and "you" or ((eS > mS) and "them" or "tie")
+      end
+    end
+
     return { active = true, party = party, trainer = trainer,
       battle = battleBlock, items = {
         bagFull = C.Bag and C.Bag.slots(save), bagCap = C.Bag and C.Bag.capacity(C.gameData) }
@@ -355,17 +404,8 @@ return function(mod)
   end
 
   -- ---------------------------------------------------------------------
-  -- Runs every frame: reads the save and animates HP bars.
+  -- Runs every frame: reads the save.
   -- ---------------------------------------------------------------------
-  local function easeHP(key, target, dt)
-    local cur = C.dispHP[key]
-    if cur == nil then cur = target end
-    cur = cur + (target - cur) * math.min(1, (dt or 0) * 7)
-    if math.abs(cur - target) < 0.5 then cur = target end
-    C.dispHP[key] = cur
-    return cur
-  end
-
   C.onFrame = function(dt)
     C.acc = (C.acc or 0) + (dt or 0)
     if not C.state or C.acc >= INTERVAL then
@@ -373,23 +413,6 @@ return function(mod)
       local ok, st = pcall(buildState)
       if ok then C.state = st
       elseif st ~= C.buildErr then C.buildErr = st; mod.log:error("kanto_ingame build: %s", tostring(st)) end
-    end
-    -- smoothly animate HP toward the real value
-    local st = C.state
-    if st then
-      for i = 1, 6 do
-        local m = st.party and st.party[i]
-        local key = "p" .. i
-        if m then
-          if C.dispSp[key] ~= m.species then C.dispSp[key] = m.species; C.dispHP[key] = m.hp end
-          easeHP(key, m.hp or 0, dt or 0)
-        else C.dispHP[key] = nil; C.dispSp[key] = nil end
-      end
-      local en = st.battle and st.battle.enemy
-      if en then
-        if C.dispSp.enemy ~= en.species then C.dispSp.enemy = en.species; C.dispHP.enemy = en.hp end
-        easeHP("enemy", en.hp or 0, dt or 0)
-      else C.dispHP.enemy = nil; C.dispSp.enemy = nil end
     end
   end
 
@@ -399,14 +422,14 @@ return function(mod)
   local s = 1
   -- Swaps symbols the game's font can't display for simple text instead.
   local SUB = {
-    ["\226\153\128"] = " (F)",  -- ♀ U+2640
-    ["\226\153\130"] = " (M)",  -- ♂ U+2642
-    ["\226\152\133"] = "*",    -- ★ U+2605 (STAB)
-    ["\226\154\160"] = "!",    -- ⚠ U+26A0 (threat)
-    ["\226\150\186"] = ">",    -- ► U+25BA (you first)
-    ["\226\151\132"] = "<",    -- ◄ U+25C4 (enemy first)
-    ["\226\151\134"] = "*",    -- ◆ U+25C6 (badge earned)
-    ["\226\151\135"] = "·",    -- ◇ U+25C7 (badge not earned)
+    ["\226\153\128"] = " (F)",  -- U+2640
+    ["\226\153\130"] = " (M)",  -- U+2642
+    ["\226\152\133"] = "*",    -- U+2605
+    ["\226\154\160"] = "!",    -- U+26A0
+    ["\226\150\186"] = ">",    -- U+25BA
+    ["\226\151\132"] = "<",    -- U+25C4
+    ["\226\151\134"] = "*",    -- U+25C6
+    ["\226\151\135"] = "\194\183",  -- U+25C7
   }
   local function sanitize(str)
     if type(str) ~= "string" then str = tostring(str) end
@@ -416,23 +439,30 @@ return function(mod)
   local function setc(c, a) love.graphics.setColor(c[1], c[2], c[3], a or 1) end
   local function rrect(mode, x, y, w, h, r)
     love.graphics.rectangle(mode, math.floor(x*s), math.floor(y*s), math.floor(w*s), math.floor(h*s),
-      (r or 0)*s, (r or 0)*s)
+      (r or 0)*s, (r or 0)*s, 16)
   end
-  local function txt(str, x, y, size, col, align, a)
+  local function textW(str, size) return getFont(size*s):getWidth(sanitize(str)) / s end
+  -- Everything is white on black, so every string gets a black outline drawn
+  -- around it. Four passes reads as cleanly as eight at these sizes.
+  local OUTLINE_OFF = { {-1,0}, {1,0}, {0,-1}, {0,1} }
+  local function txt(str, x, y, size, col, align, weight)
     str = sanitize(str)
-    local f = getFont(size*s); love.graphics.setFont(f); setc(col or COL.text, a)
+    local f = getFont(size*s); love.graphics.setFont(f)
     local X = x*s
     if align == "right" then X = X - f:getWidth(str)
     elseif align == "center" then X = X - f:getWidth(str)/2 end
-    love.graphics.print(str, math.floor(X), math.floor(y*s))
+    X, y = math.floor(X), math.floor(y*s)
+    local o = math.max(1, math.floor((weight or 0.07) * size * s + 0.5))
+    setc(COL.outline, 1)
+    for i = 1, #OUTLINE_OFF do
+      love.graphics.print(str, X + OUTLINE_OFF[i][1]*o, y + OUTLINE_OFF[i][2]*o)
+    end
+    setc(col or COL.text, 1)
+    love.graphics.print(str, X, y)
   end
-  local function textW(str, size) return getFont(size*s):getWidth(str) / s end
-  -- Fakes bold by drawing the text twice, slightly offset.
-  local function boldTxt(str, x, y, size, col, align, a)
-    txt(str, x, y, size, col, align, a)
-    txt(str, x + 1, y, size, col, align, a)
+  local function txtMid(str, x, y, size, col, align, weight)
+    txt(str, x, y - size*0.62, size, col, align, weight)
   end
-  -- shrink a string with ".." until it fits maxW (design units)
   local function ellipsize(str, size, maxW)
     if textW(str, size) <= maxW then return str end
     local s2 = str
@@ -440,51 +470,91 @@ return function(mod)
     return s2 .. ".."
   end
   local function panel(x, y, w, h, activeGold)
-    setc(COL.panel, 0.90); rrect("fill", x, y, w, h, 14)
-    love.graphics.setLineWidth(math.max(1, s))
-    if activeGold then setc(COL.gold, 0.85) else setc(COL.border, 0.85) end
+    setc(COL.panel, 1); rrect("fill", x, y, w, h, 14)
+    love.graphics.setLineWidth(math.max(1, 3*s))
+    if activeGold then setc(COL.gold, 1) else setc(COL.border, 1) end
     rrect("line", x, y, w, h, 14)
   end
+  local function subbox(x, y, w, h, fill)
+    setc(fill or COL.sub, 1); rrect("fill", x, y, w, h, 10)
+    love.graphics.setLineWidth(math.max(1, 2.8*s))
+    setc(COL.border, 1); rrect("line", x, y, w, h, 10)
+  end
+  local function drawImg(img, x, y, size)
+    if not img then return end
+    local iw, ih = img:getDimensions()
+    local sc = (size / math.max(iw, ih)) * s
+    setc(COL.text, 1)
+    love.graphics.draw(img, math.floor(x*s + (size*s - iw*sc)/2),
+      math.floor(y*s + (size*s - ih*sc)/2), 0, sc, sc)
+  end
+  local function fitImg(img, x, y, w, h, flip)
+    if not img then return end
+    local iw, ih = img:getDimensions()
+    local sc = math.min(w*s / iw, h*s / ih)
+    local ox = math.floor(x*s + (w*s - iw*sc)/2)
+    local oy = math.floor(y*s + (h*s - ih*sc)/2)
+    setc(COL.text, 1)
+    if flip then love.graphics.draw(img, ox + iw*sc, oy, 0, -sc, sc)
+    else love.graphics.draw(img, ox, oy, 0, sc, sc) end
+  end
+  -- The type art is a flat disc with no border, so the ring is drawn here and
+  -- stays the same weight whatever size the icon is used at.
+  local function typeIcon(t, x, y, size)
+    local img = typeIconImg(t)
+    if img then
+      drawImg(img, x, y, size)
+      love.graphics.setLineWidth(math.max(1, 3.2*s))
+      setc(COL.border, 1)
+      love.graphics.circle("line", math.floor((x + size/2)*s), math.floor((y + size/2)*s),
+        (size/2 - size*0.025)*s, 48)
+    else
+      subbox(x, y, size, size, COL.plate)
+      txtMid(tostring(t):sub(1,3), x + size/2, y + size/2, size*0.34, COL.text, "center")
+    end
+    return size
+  end
+  -- Status art carries its own black outline, so it needs a plate to sit on.
+  local function iconPlate(path, x, y, size, pad)
+    pad = pad or 4
+    local box = size + pad*2
+    setc(COL.plate, 1); rrect("fill", x, y, box, box, box*0.28)
+    love.graphics.setLineWidth(math.max(1, 2.2*s))
+    setc(COL.border, 1); rrect("line", x, y, box, box, box*0.28)
+    drawImg(uiImage(path), x + pad, y + pad, size)
+    return box
+  end
+  local function statusIcons(m, x, y, size, rightToLeft)
+    local list = {}
+    if m.status and STATUS_ICON[m.status] then list[#list+1] = STATUS_ICON[m.status] end
+    if m.confusedTurns then list[#list+1] = "confuse" end
+    if #list == 0 then return 0 end
+    local box = size + 8
+    local cx = x
+    if rightToLeft then cx = x - (#list * (box + 6) - 6) end
+    for _, nm in ipairs(list) do
+      cx = cx + iconPlate(mod.assets:path("assets/status/" .. nm .. ".png"), cx, y, size) + 6
+    end
+    return #list
+  end
   local function bar(x, y, w, h, frac, col)
-    setc(COL.barbg, 0.15); rrect("fill", x, y, w, h, h/2)
-    if frac and frac > 0 then setc(col, 1); rrect("fill", x, y, w*math.min(1,frac), h, h/2) end
+    setc(COL.panel, 1); rrect("fill", x, y, w, h, h/2)
+    love.graphics.setLineWidth(math.max(1, 1.6*s))
+    setc(COL.border, 1); rrect("line", x, y, w, h, h/2)
+    if frac and frac > 0 then
+      setc(col, 1)
+      rrect("fill", x + 2, y + 2, math.max(3, (w - 4)*math.min(1, frac)), h - 4, (h-4)/2)
+    end
   end
-  local function hpCol(f) return f > 0.5 and COL.hi or (f > 0.2 and COL.mid or COL.lo) end
-  local function chip(x, y, label, col)
-    local w = textW(label, 14) + 12
-    setc(col, 1); rrect("fill", x, y, w, 20, 5)
-    txt(label, x + 6, y + 3, 14, COL.text)
-    return w + 5
-  end
-  -- Status and confusion badges shown next to a Pokemon's name.
-  local STATUS_BADGE = {
-    SLP = { text = "ZZZ", bg = hex("6fc3ff"), fg = {0.05, 0.05, 0.05} },
-    PAR = { text = "PAR", bg = hex("ffd83d"), fg = {0.08, 0.07, 0.05} },
-    BRN = { text = "BRN", bg = hex("e0632c"), fg = {1, 1, 1} },
-    FRZ = { text = "FRZ", bg = hex("6fc3ff"), fg = {1, 1, 1} },
-    PSN = { text = "PSN", bg = hex("9a4dff"), fg = {1, 1, 1} },
-  }
-  local CONFUSE_BADGE = { text = "CNF", bg = hex("4dd9d9"), fg = {0.04, 0.28, 0.28} }
-  local TAR_BADGE = { text = "TAR", bg = hex("afa981"), fg = {0.08, 0.07, 0.05} }
-  local function condChip(x, y, def)
-    local w = textW(def.text, 14) + 14
-    setc(def.bg, 1); rrect("fill", x, y, w, 22, 6)
-    boldTxt(def.text, x + w/2, y + 4, 14, def.fg, "center")
-    return w + 6
-  end
-  local function money(n) local s2 = tostring(math.floor(n or 0)); local o = s2:reverse():gsub("(%d%d%d)","%1,"):reverse():gsub("^,",""); return "¥"..o end
+  local function money(n) local s2 = tostring(math.floor(n or 0)); local o = s2:reverse():gsub("(%d%d%d)","%1,"):reverse():gsub("^,",""); return "\194\165"..o end
   local function titleCase(s)
     s = (s or ""):lower():gsub("_", " ")
     return (s:gsub("(%a)([%w']*)", function(a, b) return a:upper() .. b end))
   end
-  local function fmtTime(sec) sec = sec or 0; return string.format("%d:%02d", math.floor(sec/3600), math.floor(sec/60)%60) end
   local function fmtTimeHMS(sec)
     sec = math.floor(sec or 0)
     return string.format("%d:%02d:%02d", math.floor(sec/3600), math.floor(sec/60)%60, sec%60)
   end
-  local function pct(p) if p == nil then return "—" end; if p >= 100 then return "100%" end; if p < 1 then return (p < 0.1 and "<0.1%") or (string.format("%.1f%%", p)) end; return math.floor(p+0.5).."%" end
-  local EFFLBL = { [0]="×0", [2]="×¼", [5]="×½", [10]="×1", [20]="×2", [40]="×4" }
-  local function effText(m) return EFFLBL[m] or ("×"..(m/10)) end
   local function effPower(mv)
     if not (mv and mv.power) then return nil end
     local p = mv.power
@@ -501,409 +571,266 @@ return function(mod)
   -- ---------------------------------------------------------------------
   -- Draws each panel. Each one returns how tall it drew.
   -- ---------------------------------------------------------------------
-  local COLW = 463        -- battle column width (party/stats/enemy) -- trimmed 5px
-  local HUD_COLW = 420    -- top-right HUD cluster: game time/resets + badge row
+  local COLW = 463        -- battle column width (party / enemy)
+  local HUD_COLW = 463    -- top-right HUD cluster, same width so the edge lines up
   local EDGE_MARGIN = 4   -- how tight panels hug the screen edges
-  local PANEL_GAP = 6     -- vertical gap between info panel and its stat panel
   local HUD_GAP = 10      -- vertical gap inside the top-right HUD stack
   local PAD = 16
+  local GAP = 12
 
-  -- Party row style: F7 toggles full (types, HP, XP, moves) vs compact.
-  local function moveRows(m) return 4 end
-  local function measureMon(m, style)
-    if style == 2 then return 54 end
-    local hasXP = m.xpProgress ~= nil
-    -- Figures out how tall this Pokemon's box needs to be.
-    local bodyH = 84 + 10 + ((m.growthRate or m.ability) and 20 or 0) + (hasXP and 34 or 0) + 6 + moveRows(m)*26
-    return math.max(76, bodyH)
-  end
+  local SPRITE_BOX = 186  -- player's sprite box, square
+  local NAME_SIZE = 34    -- fixed, sized against VICTREEBEL / NIDOQUEEN
+  local MOVE_SIZE = 22    -- fixed, sized against SEISMIC TOSS *
+  local MOVE_ROW = 52
+  local STAT_H = 108
+  local MOVEBOX_H = 12 + 4*MOVE_ROW + 12
+  local STATS_H = STAT_H*2 + GAP
+  local PARTY_PANEL_H = PAD + SPRITE_BOX + GAP + MOVEBOX_H + GAP + STATS_H + PAD
+  local ENEMY_SB_H = 230
+  local ENEMY_PANEL_H = PAD + ENEMY_SB_H + GAP + STATS_H + PAD
 
-  local function drawMonRow(m, x, y, w, key, style)
-    local rowH = measureMon(m, style)
-    local dispHp = C.dispHP[key] or m.hp or 0
-    local frac = math.max(0, math.min(1, dispHp / (m.maxhp or 1)))
-
-    if style == 2 then
-      -- Compact style: sprite next to text.
-      local sp, bodyX = 52, 66
-      local bodyW = w - bodyX
-      local img = getSprite(m.species, C.dPoke)
-      if img then
-        local iw, ih = img:getDimensions(); local sc = (sp / math.max(iw, ih)) * s
-        setc(COL.text, dispHp <= 0 and 0.5 or 1)
-        love.graphics.draw(img, math.floor(x*s) + iw*sc, math.floor((y + (rowH-sp)/2)*s), 0, -sc, sc)
-      end
-      local cy = y + 2
-      txt(m.name, x + bodyX, cy, 20, COL.text)
-      local tx = x + bodyX + textW(m.name, 20) + 8
-      if m.types then for _, t in ipairs(m.types) do tx = tx + chip(tx, cy + 1, t, TYPE[t] or COL.dim) end end
-      if m.status and m.status ~= "OK" then tx = tx + chip(tx, cy + 1, m.status, COL.lo) end
-      txt("Lv " .. (m.level or "?"), x + w, cy + 2, 15, COL.dim, "right")
-      cy = cy + 24
-      local numStr = string.format("%d/%d", math.floor(dispHp + 0.5), m.maxhp or 0)
-      local numW = textW(numStr, 15) + 10
-      bar(x + bodyX, cy + 2, bodyW - numW, 10, frac, hpCol(frac))
-      txt(numStr, x + w, cy, 15, COL.text, "right", 0.9)
-      cy = cy + 18
-      if m.xpProgress ~= nil then bar(x + bodyX, cy, bodyW, 6, m.xpProgress, COL.xp) end
-      return rowH
-    end
-
-    -- Full style: sprite on the left, everything else stacked next to it.
-    local cy = y
-    local sp = 84
-    local bodyX = sp + 14
-    local bodyW = w - bodyX
-    local blockTop = cy
-
-    local img = getSprite(m.species, C.dPoke)
-    if img then
-      local iw, ih = img:getDimensions(); local sc = (sp / math.max(iw, ih)) * s
-      setc(COL.text, dispHp <= 0 and 0.5 or 1)
-      love.graphics.draw(img, math.floor(x*s) + iw*sc, math.floor(blockTop*s), 0, -sc, sc)
-    end
-
-    if m.types and #m.types > 0 then
-      local tx = x + bodyX; for _, t in ipairs(m.types) do tx = tx + chip(tx, cy, t, TYPE[t] or COL.dim) end
-      cy = cy + 24
-    end
-    bar(x + bodyX, cy, bodyW, 12, frac, hpCol(frac)); cy = cy + 18
-    txt(string.format("%d / %d HP", math.floor(dispHp + 0.5), m.maxhp or 0), x + bodyX, cy, 19, COL.text, nil, 0.9)
-    cy = math.max(cy + 19, blockTop + sp) + 10
-
-    if m.growthRate or m.ability then
-      if m.growthRate then txt(titleCase(m.growthRate), x, cy, 16, COL.text) end
-      if m.ability then txt(titleCase(m.ability), x + w, cy, 16, COL.gold, "right") end
-      cy = cy + 20
-    end
-    if m.xpProgress ~= nil then
-      bar(x, cy, w, 8, m.xpProgress, COL.xp); cy = cy + 12
-      local lbl = (m.xpToNext and m.xpToNext > 0) and (money(m.xpToNext):gsub("¥","") .. " XP to Lv " .. ((m.level or 0)+1))
-        or (((m.exp and money(m.exp):gsub("¥","")) or "0") .. " XP · Max")
-      txt(lbl, x, cy, 17, COL.text); cy = cy + 22
-    end
-    cy = cy + 6
-    -- Always shows 4 move rows so the panel height never changes.
-    local mf = 17
-    for i = 1, 4 do
-      local mv = m.moves and m.moves[i]
-      local my = cy + (i-1)*26
-      if mv then
-        if mv.best then setc(COL.hi, 0.12); rrect("fill", x - 6, my - 2, w + 12, 24, 6) end
-        local cx = x
-        if mv.type then cx = cx + chip(cx, my + 1, mv.type, TYPE[mv.type] or COL.dim) end
-        txt(mv.name .. (mv.stab and "  *" or ""), cx, my, mf, COL.text, nil, 0.95)
-        local pp = (mv.pp ~= nil and mv.maxpp ~= nil) and (mv.pp.."/"..mv.maxpp) or ""
-        if mv.mult ~= nil and not mv.status then
-          local tier = mv.mult == 0 and COL.lo or (mv.mult > 10 and COL.super or (mv.mult == 10 and COL.dim or COL.resist))
-          txt(effText(mv.mult), x + w - 140, my, mf - 3, tier, "right")
-        end
-        local pw = effPower(mv)
-        txt((pw and (pw.." pow") or (mv.status and "STATUS" or "--")) .. "  ·  " .. pp, x + w, my, mf - 3, COL.text, "right")
-      else
-        txt("—", x, my, mf, COL.dim, nil, 0.5)
-        txt("—  ·  —", x + w, my, mf - 3, COL.dim, "right", 0.5)
-      end
-    end
-    return rowH
-  end
-
-  -- Only shows your lead Pokemon, not the whole party.
-  local PARTY_HEADER_H = 44
-  local function partyPanelHeight(m, style)
-    return PAD + PARTY_HEADER_H + measureMon(m, style) + (PAD - 6)
-  end
-  local function party(st, x, y, styleOverride)
-    local w = COLW; local style = styleOverride or 1
-    local m = (st.party or {})[1]
-    if not m then return 0 end
-    local h = partyPanelHeight(m, style)
-    panel(x, y, w, h, false)
-    txt(m.name, x + PAD, y + PAD, 31, COL.text)
-    local nx = x + PAD + textW(m.name, 31) + 12
-    if m.status and STATUS_BADGE[m.status] then nx = nx + condChip(nx, y + PAD + 6, STATUS_BADGE[m.status]) end
-    if m.confusedTurns then nx = nx + condChip(nx, y + PAD + 6, CONFUSE_BADGE) end
-    txt("Lv " .. (m.level or "?"), x + w - PAD, y + PAD + 3, 19, COL.text, "right")
-    local cy = y + PAD + PARTY_HEADER_H
-    drawMonRow(m, x + PAD, cy, w - PAD*2, "p1", style)
-    return h
-  end
-
-  -- 6 stat boxes. Crit chance uses the Pokemon's base speed stat.
   local STAT_COL = {
     HP = hex("ff8a3d"), ATK = hex("ffd83d"), DEF = hex("6fe89a"),
     SPC = hex("6fc3ff"), SPD = hex("b48bff"), CRIT = hex("ff7fc0"),
   }
-  local STAT_DARK = {0.08, 0.07, 0.09}
-  -- Small badge showing a stat boost/drop, only if one is active.
+  local BADGE_STAT_INDEX = { attack = 1, defense = 3, speed = 5, special = 7 }
+
   local function stageBadge(x, y, w, h, stage)
     if not stage or stage == 0 then return end
-    local bw, bh = 32, 26
-    local bx, by = x + w - bw - 4, y + h - bh - 4
-    setc({1, 1, 1}, 0.95); rrect("fill", bx, by, bw, bh, 6)
-    love.graphics.setLineWidth(math.max(1, s))
-    setc({0.1, 0.1, 0.12}, 0.85); rrect("line", bx, by, bw, bh, 6)
-    local col = stage > 0 and {0.05, 0.45, 0.08} or {0.55, 0.05, 0.05}
-    boldTxt((stage > 0 and "+" or "") .. tostring(stage), bx + bw/2, by + 4, 15, col, "center")
+    local bw, bh = 40, 30
+    local bx, by = x + w - bw - 6, y + h - bh - 6
+    setc(COL.border, 1); rrect("fill", bx, by, bw, bh, 7)
+    love.graphics.setLineWidth(math.max(1, 1.6*s))
+    setc(COL.outline, 1); rrect("line", bx, by, bw, bh, 7)
+    local col = stage > 0 and {0.04, 0.43, 0.1} or {0.59, 0.06, 0.06}
+    txt((stage > 0 and "+" or "") .. tostring(stage), bx + bw/2, by + 5, 18, col, "center", 0.05)
   end
-  local function statBox(x, y, w, h, label, value, col, stage, badgeIndex)
-    setc(col, 0.95); rrect("fill", x, y, w, h, 10)
-    boldTxt(label, x + w/2, y + 12, 16, STAT_DARK, "center")
-    local vsz = 34
-    while textW(value, vsz) > w - 16 and vsz > 18 do vsz = vsz - 1 end
-    boldTxt(value, x + w/2, y + 36, vsz, STAT_DARK, "center")
+
+  local function hpDot(cur, mx)
+    if not (cur and mx and mx > 0) then return nil end
+    if cur >= mx then return COL.hpFull end
+    if cur / mx >= 0.25 then return COL.hpHurt end
+    return COL.hpLow
+  end
+
+  local function statBox(x, y, w, h, label, value, col, stage, badgeIndex, dot)
+    setc(col, 1); rrect("fill", x, y, w, h, 10)
+    love.graphics.setLineWidth(math.max(1, 2.8*s))
+    setc(COL.border, 1); rrect("line", x, y, w, h, 10)
+    local lsz = 22
+    if dot then
+      local lw = textW(label, lsz)
+      local dsz = 21
+      local lx = x + w/2 - (lw + 8 + dsz)/2
+      txt(label, lx + dsz + 8, y + h*0.11, lsz, COL.text, nil, 0.10)
+      local cx2, cy2 = lx + dsz/2, y + h*0.11 + 3 + dsz/2
+      setc(dot, 1)
+      love.graphics.circle("fill", math.floor(cx2*s), math.floor(cy2*s), (dsz/2)*s, 24)
+      love.graphics.setLineWidth(math.max(1, 2.6*s))
+      setc(COL.outline, 1)
+      love.graphics.circle("line", math.floor(cx2*s), math.floor(cy2*s), (dsz/2)*s, 24)
+    else
+      txt(label, x + w/2, y + h*0.11, lsz, COL.text, "center", 0.10)
+    end
+    local vsz = h*0.42
+    while textW(value, vsz) > w - 20 and vsz > 16 do vsz = vsz - 1 end
+    txt(value, x + w/2, y + h*0.38, vsz, COL.text, "center")
     stageBadge(x, y, w, h, stage)
     if badgeIndex then
       -- Shows which badge is boosting this stat.
-      local img = uiImage(mod.assets:path("assets/badges/badge" .. badgeIndex .. "_true.png"))
-      if img then
-        local iw, ih = img:getDimensions()
-        local size = 24
-        local sc = (size / math.max(iw, ih)) * s
-        setc(COL.text, 1)
-        love.graphics.draw(img, math.floor((x+4)*s), math.floor((y+4)*s), 0, sc, sc)
-      end
+      drawImg(uiImage(mod.assets:path("assets/badges/badge" .. badgeIndex .. "_true.png")), x + 6, y + 6, 26)
     end
   end
-  -- Fixed height so this panel can always be anchored to the bottom.
-  local STATS_BOX_H = 84
-  local STATS_GAP = 12
-  local STATS_PANEL_H = PAD + STATS_BOX_H*2 + STATS_GAP + PAD
-  local BADGE_STAT_INDEX = { attack = 1, defense = 3, speed = 5, special = 7 }
-  local function statsPanelFor(x, y, m)
-    local stats = m and m.stats or {}
+
+  local function statGrid(x, y, w, m, cols, showHPDot)
+    local stats = (m and m.shown) or (m and m.stats) or {}
     local stages = (m and m.stages) or {}
     local badgeStat = (m and m.badgeStat) or {}
-    local live = m and m.liveStats   -- real, live stats during battle
-    local statusPenalty = m and m.status and C.Status and C.Status.RECORDS
-      and C.Status.RECORDS[m.status] and C.Status.RECORDS[m.status].statPenalty
-    local w = COLW; local gap = STATS_GAP
-    local bw = (w - PAD*2 - gap*2) / 3
-    local bh = STATS_BOX_H
-    panel(x, y, w, STATS_PANEL_H, false)
-    local by = y + PAD
+    local gapc = GAP
+    local bw = (w - gapc*(cols-1)) / cols
     local critPct = m and m.baseSpeed and (m.baseSpeed / 512 * 100) or nil
-    local critStr = critPct and (string.format("%.2f", critPct) .. "%") or "--"
-    -- Uses the real battle stat if there is one; otherwise calculates it.
-    local function adjusted(base, key)
-      if live and live[key] ~= nil then return live[key] end
-      if base == nil then return nil end
-      local v = base
-      local stg = stages[key]
-      if stg and stg ~= 0 and C.Stats and C.Stats.applyStage then
-        v = C.Stats.applyStage(v, stg)
-      end
-      if badgeStat[key] then v = math.floor(v * 9 / 8) end
-      if statusPenalty and statusPenalty.stat == key then
-        v = math.max(1, math.floor(v / statusPenalty.div))
-      end
-      return v
-    end
-    local row1 = {
-      {"HP", stats.hp, STAT_COL.HP, stages.accuracy, nil},
-      {"ATK", adjusted(stats.attack, "attack"), STAT_COL.ATK, stages.attack, badgeStat.attack and BADGE_STAT_INDEX.attack},
-      {"DEF", adjusted(stats.defense, "defense"), STAT_COL.DEF, stages.defense, badgeStat.defense and BADGE_STAT_INDEX.defense},
+    local critStr = critPct and string.format("%.1f%%", critPct) or "--"
+    local dot = showHPDot and hpDot(m and m.hp, stats.hp) or nil
+    local hpVal = showHPDot and (m and m.hp) or stats.hp
+    local rows = {
+      { "HP",   hpVal,          STAT_COL.HP,   stages.accuracy, nil, dot },
+      { "ATK",  stats.attack,   STAT_COL.ATK,  stages.attack,   badgeStat.attack and BADGE_STAT_INDEX.attack },
+      { "DEF",  stats.defense,  STAT_COL.DEF,  stages.defense,  badgeStat.defense and BADGE_STAT_INDEX.defense },
+      { "SPC",  stats.special,  STAT_COL.SPC,  stages.special,  badgeStat.special and BADGE_STAT_INDEX.special },
+      { "SPD",  stats.speed,    STAT_COL.SPD,  stages.speed,    badgeStat.speed and BADGE_STAT_INDEX.speed },
+      { "CRIT", critStr,        STAT_COL.CRIT, stages.evasion,  nil },
     }
-    local row2 = {
-      {"SPC", adjusted(stats.special, "special"), STAT_COL.SPC, stages.special, badgeStat.special and BADGE_STAT_INDEX.special},
-      {"SPD", adjusted(stats.speed, "speed"), STAT_COL.SPD, stages.speed, badgeStat.speed and BADGE_STAT_INDEX.speed},
-      {"CRIT", critStr, STAT_COL.CRIT, stages.evasion, nil},
-    }
-    for i, e in ipairs(row1) do
-      statBox(x + PAD + (i-1)*(bw+gap), by, bw, bh, e[1], tostring(e[2] or "--"), e[3], e[4], e[5])
+    for i, e in ipairs(rows) do
+      local cx = x + ((i-1) % cols) * (bw + gapc)
+      local cy = y + math.floor((i-1) / cols) * (STAT_H + gapc)
+      statBox(cx, cy, bw, STAT_H, e[1], tostring(e[2] or "--"), e[3], e[4], e[5], e[6])
     end
-    for i, e in ipairs(row2) do
-      local val = (e[1] == "CRIT") and e[2] or tostring(e[2] or "--")
-      statBox(x + PAD + (i-1)*(bw+gap), by + bh + gap, bw, bh, e[1], val, e[3], e[4], e[5])
+    return STAT_H*2 + gapc
+  end
+
+  -- Only shows your lead Pokemon, not the whole party.
+  local function party(st, x, y)
+    local m = (st.party or {})[1]
+    if not m then return 0 end
+    local w = COLW
+    panel(x, y, w, PARTY_PANEL_H, false)
+    local iL, iW = x + PAD, w - PAD*2
+
+    local sbx, sby = iL, y + PAD
+    subbox(sbx, sby, SPRITE_BOX, SPRITE_BOX)
+    fitImg(getSprite(m.species, C.dPoke), sbx + 12, sby + 6, SPRITE_BOX - 24, SPRITE_BOX - 40, true)
+    statusIcons(m, sbx + 7, sby + SPRITE_BOX - 57, 42, false)
+
+    local bx = sbx + SPRITE_BOX + GAP
+    local bw = x + w - PAD - bx
+    txt(ellipsize(m.name, NAME_SIZE, bw), bx, sby - 2, NAME_SIZE)
+
+    local ty, tsz = sby + 44, 48
+    local tx = bx
+    for _, t in ipairs(m.types or {}) do tx = tx + typeIcon(t, tx, ty, tsz) + 8 end
+    txtMid("Lv " .. (m.level or "?"), x + w - PAD, ty + tsz/2, 30, COL.text, "right")
+
+    local gy = ty + tsz + 10
+    if m.growthRate then txt(titleCase(m.growthRate), bx, gy, 22) end
+    if m.xpProgress ~= nil then
+      local xby = gy + 30
+      bar(bx, xby, bw, 12, m.xpProgress, COL.xp)
+      local lbl = (m.xpToNext and m.xpToNext > 0)
+        and (money(m.xpToNext):gsub("\194\165","") .. " XP to Lv " .. ((m.level or 0)+1))
+        or (((m.exp and money(m.exp):gsub("\194\165","")) or "0") .. " XP \194\183 Max")
+      txt(lbl, bx, xby + 20, 21)
     end
-    return STATS_PANEL_H
+
+    local mby = y + PAD + SPRITE_BOX + GAP
+    subbox(iL, mby, iW, MOVEBOX_H)
+    local mL, mR = iL + 12, iL + iW - 12
+    local ppR = mR
+    local powR = ppR - 90
+    local nameL = mL + 42 + 12
+    local nameMax = powR - 58 - nameL
+    for i = 1, 4 do
+      local mv = m.moves and m.moves[i]
+      local ry = mby + 12 + (i-1)*MOVE_ROW
+      local cy = ry + MOVE_ROW/2
+      if mv then
+        if mv.best then
+          setc(COL.bestFill, 1); rrect("fill", mL - 4, ry + 2, (mR - mL) + 8, MOVE_ROW - 4, 8)
+          love.graphics.setLineWidth(math.max(1, 1.8*s))
+          setc(COL.bestLine, 1); rrect("line", mL - 4, ry + 2, (mR - mL) + 8, MOVE_ROW - 4, 8)
+        end
+        if mv.type then typeIcon(mv.type, mL, cy - 21, 42) end
+        local pw = effPower(mv)
+        local nm = mv.name .. ((pw and mv.stab) and " *" or "")
+        txtMid(ellipsize(nm, MOVE_SIZE, nameMax), nameL, cy, MOVE_SIZE)
+        txtMid(pw and tostring(pw) or "\226\128\148", powR, cy, MOVE_SIZE, COL.text, "right")
+        local pp = (mv.pp ~= nil and mv.maxpp ~= nil) and (mv.pp.."/"..mv.maxpp) or "--"
+        txtMid(pp, ppR, cy, 20, COL.text, "right")
+      else
+        txtMid("\226\128\148", nameL, cy, MOVE_SIZE, COL.dim)
+        txtMid("\226\128\148", ppR, cy, 20, COL.dim, "right")
+      end
+    end
+
+    statGrid(iL, mby + MOVEBOX_H + GAP, iW, m, 3, true)
+    return PARTY_PANEL_H
   end
-  local function statsPanel(st, x, y)
-    return statsPanelFor(x, y, (st.party or {})[1])
-  end
-  local function enemyStatsPanel(st, x, y)
-    return statsPanelFor(x, y, st.battle and st.battle.enemy)
+
+  -- Enemy panel: sprite in its own box, icons in the gutters either side.
+  local function enemyPanel(st, x, y)
+    local b = st.battle; if not b then return 0 end
+    local en = b.enemy or {}
+    local w = COLW
+    panel(x, y, w, ENEMY_PANEL_H, false)
+    local iL, iW = x + PAD, w - PAD*2
+
+    local hy = y + PAD
+    local sbw = 264
+    local sbx = iL + (iW - sbw)/2
+    subbox(sbx, hy, sbw, ENEMY_SB_H)
+    fitImg(getSprite(en.species, C.dPoke), sbx + 12, hy + 10, sbw - 24, ENEMY_SB_H - 20, false)
+
+    local isz = 56
+    local gl = iL + ((sbx - iL) - isz)/2
+    local ty = hy + 6
+    for _, t in ipairs(en.types or {}) do typeIcon(t, gl, ty, isz); ty = ty + isz + 8 end
+
+    local gr = sbx + sbw + ((iL + iW) - (sbx + sbw) - isz)/2
+    local arrow = b.faster == "you" and "faster" or (b.faster == "them" and "slower"
+      or (b.faster == "tie" and "tie" or nil))
+    if arrow then
+      drawImg(uiImage(mod.assets:path("assets/speed/" .. arrow .. ".png")), gr, hy + 6, isz)
+    end
+
+    statusIcons(en, sbx + sbw - 7, hy + ENEMY_SB_H - 57, 42, true)
+    statGrid(iL, hy + ENEMY_SB_H + GAP, iW, en, 3, false)
+    return ENEMY_PANEL_H
   end
 
   -- Play time and resets, plus a repel box that only shows up while active.
   local function statBoxPlain(x, y, w, h, label, value, col)
     panel(x, y, w, h, false)
-    -- Text placement is proportional so the same box style works at any height.
-    local labelY = y + math.max(7, h * 0.13)
-    local valueY = y + h * 0.36
-    boldTxt(label, x + w/2, labelY, 14, col or COL.text, "center")
-    local vsz = math.min(38, math.floor(h - (h * 0.36) - 6))
-    while textW(value, vsz) > w - 20 and vsz > 14 do vsz = vsz - 1 end
-    boldTxt(value, x + w/2, valueY, vsz, col or COL.text, "center")
+    txt(label, x + w/2, y + 10, 20, col or COL.text, "center", 0.10)
+    local vsz = 40
+    while textW(value, vsz) > w - 24 and vsz > 14 do vsz = vsz - 1 end
+    txt(value, x + w/2, y + 34, vsz, col or COL.text, "center")
   end
   -- 8 badge slots in a single thin row, evenly spaced, filled in once earned.
-  local BADGE_ICON = 25
-  local BADGE_ROW_PAD_V = 12
-  local BADGE_ROW_H = BADGE_ROW_PAD_V*2 + BADGE_ICON
+  local BADGE_ICON = 32
+  local BADGE_ROW_H = 60
   local function badgeRow(st, x, y)
     local w = HUD_COLW
     panel(x, y, w, BADGE_ROW_H, false)
     local badges = (st.trainer and st.trainer.badges) or {}
-    local innerW = w - PAD*2
-    local gapX = (innerW - 8*BADGE_ICON) / 7
-    local by = y + BADGE_ROW_PAD_V
+    local gapX = (w - PAD*2 - 8*BADGE_ICON) / 7
+    local by = y + (BADGE_ROW_H - BADGE_ICON)/2
     for i = 0, 7 do
       local bx = x + PAD + i*(BADGE_ICON + gapX)
-      local b = badges[i+1]
-      local owned = b and b.owned
-      love.graphics.setLineWidth(math.max(1, s))
-      setc(COL.border, 0.5); rrect("line", bx - 2, by - 2, BADGE_ICON + 4, BADGE_ICON + 4, 5)
-      local img = uiImage(mod.assets:path(
-        "assets/badges/badge" .. (i+1) .. "_" .. (owned and "true" or "false") .. ".png"))
-      if img then
-        local iw, ih = img:getDimensions()
-        local sc = (BADGE_ICON / math.max(iw, ih)) * s
-        setc(COL.text, 1)
-        love.graphics.draw(img, math.floor(bx*s), math.floor(by*s), 0, sc, sc)
-      end
+      local owned = badges[i+1] and badges[i+1].owned
+      love.graphics.setLineWidth(math.max(1, 1.6*s))
+      setc(COL.border, owned and 1 or 0.45); rrect("line", bx - 3, by - 3, BADGE_ICON + 6, BADGE_ICON + 6, 6)
+      drawImg(uiImage(mod.assets:path(
+        "assets/badges/badge" .. (i+1) .. "_" .. (owned and "true" or "false") .. ".png")),
+        bx, by, BADGE_ICON)
     end
     return BADGE_ROW_H
   end
 
   -- Top-right HUD, built from the top down so nothing shifts around.
-  local GT_BOX_H = 70
+  local GT_BOX_H = 86
   local GT_GAP = 12
   local function gameTimePanel(st, x, y)
     local t = st.trainer
-    local w = HUD_COLW; local gap = GT_GAP
-    local bw = (w - gap) / 2
+    local bw = (HUD_COLW - GT_GAP) / 2
     local frozen = t and t.timeFrozen
     statBoxPlain(x, y, bw, GT_BOX_H, frozen and "FINAL TIME" or "GAME TIME",
       t and fmtTimeHMS(t.playTime) or "--", frozen and COL.gold or nil)
-    statBoxPlain(x + bw + gap, y, bw, GT_BOX_H, "RESETS", tostring(C.resets or 0))
+    statBoxPlain(x + bw + GT_GAP, y, bw, GT_BOX_H, "RESETS", tostring(C.resets or 0))
     return GT_BOX_H
   end
 
   -- Repel and bag warnings -- both hang off the bottom of the badge row.
-  -- Repel matches a game time/resets box exactly so the HUD stays uniform.
   local REPEL_BOX_W = (HUD_COLW - GT_GAP) / 2
-  local REPEL_BOX_H = GT_BOX_H
-  local BAG_BOX_H = 53 -- slightly smaller than before; independent of repel now that it's moved
-  local BAG_BOX_W = BAG_BOX_H -- still square
-  local BAG_ICON_SIZE = 44 -- same ~8% margin ratio as the last size that looked right
+  local BAG_BOX_H = 70
   local function repelPanel(st, x, y)
     local t = st.trainer
     if not (t and (t.repelSteps or 0) > 0) then return 0 end
-    statBoxPlain(x, y, REPEL_BOX_W, REPEL_BOX_H, "REPEL", tostring(t.repelSteps))
-    return REPEL_BOX_H
+    statBoxPlain(x, y, REPEL_BOX_W, GT_BOX_H, "REPEL", tostring(t.repelSteps))
+    return GT_BOX_H
   end
 
-  local function bagPanel(st, rightEdge, y)
+  local function bagPanel(st, x, y)
     local badges = (st.trainer and st.trainer.badges) or {}
-    local earthOwned = badges[8] and badges[8].owned
+    if badges[8] and badges[8].owned then return 0 end
     local it = st.items or {}
-    local function log(tag, fmt, ...)
-      if C.lastBagLog ~= tag then
-        C.lastBagLog = tag
-        mod.log:info("bagPanel: " .. fmt, ...)
-      end
-    end
-    if earthOwned then
-      log("earth", "hidden -- Earth Badge is owned")
-      return 0
-    end
-    if not (it.bagFull and it.bagCap) then
-      log("nodata", "hidden -- no bag data (bagFull=%s bagCap=%s, C.Bag=%s)",
-        tostring(it.bagFull), tostring(it.bagCap), tostring(C.Bag ~= nil))
-      return 0
-    end
+    if not (it.bagFull and it.bagCap) then return 0 end
     local remaining = it.bagCap - it.bagFull
     local iconPath = remaining <= 0 and "assets/ui/bag_red.png"
       or remaining == 1 and "assets/ui/bag_yellow.png"
       or remaining == 2 and "assets/ui/bag_green.png"
-    if not iconPath then
-      log("toolow", "hidden -- bagFull=%d bagCap=%d (remaining=%d, not 0/1/2)", it.bagFull, it.bagCap, remaining)
-      return 0
-    end
-    log(iconPath, "showing %s -- bagFull=%d bagCap=%d", iconPath, it.bagFull, it.bagCap)
-    local x = rightEdge - BAG_BOX_W
-    panel(x, y, BAG_BOX_W, BAG_BOX_H, false)
-    local img = uiImage(mod.assets:path(iconPath))
-    if img then
-      local iw, ih = img:getDimensions()
-      local sc = (BAG_ICON_SIZE / math.max(iw, ih)) * s
-      setc(COL.text, 1)
-      local offX = (BAG_BOX_W - BAG_ICON_SIZE) / 2
-      local offY = (BAG_BOX_H - BAG_ICON_SIZE) / 2
-      love.graphics.draw(img, math.floor((x + offX)*s), math.floor((y + offY)*s), 0, sc, sc)
-    end
+    if not iconPath then return 0 end
+    panel(x, y, BAG_BOX_H, BAG_BOX_H, false)
+    drawImg(uiImage(mod.assets:path(iconPath)), x + 8, y + 8, 54)
     return BAG_BOX_H
-  end
-
-  -- Enemy panel: mirrors the player's panel, sprite on the right instead.
-  local ENEMY_HEADER_H = 36
-  local ENEMY_ROW_H = 90 + 20 + 4*26
-  local ENEMY_PANEL_H = PAD + ENEMY_HEADER_H + ENEMY_ROW_H + (PAD - 6)
-  local function enemyPanel(st, x, y)
-    local b = st.battle; if not b then return 0 end
-    local en = b.enemy or {}; local m = b.matchup or {}
-    local w = COLW
-    local sp = 84
-    local bodyX = 0    -- content starts at the left edge; sprite is on the right instead
-    local bodyW = w - sp - 14
-
-    local h = ENEMY_PANEL_H
-    panel(x, y, w, h, false)
-    txt(en.name or "?", x + PAD, y + PAD, 31, COL.text)
-    local nx = x + PAD + textW(en.name or "?", 31) + 12
-    if en.status and STATUS_BADGE[en.status] then nx = nx + condChip(nx, y + PAD + 6, STATUS_BADGE[en.status]) end
-    if en.confusedTurns then nx = nx + condChip(nx, y + PAD + 6, CONFUSE_BADGE) end
-    if en.tarred then nx = nx + condChip(nx, y + PAD + 6, TAR_BADGE) end
-    txt("Lv " .. (en.level or "?"), x + w - PAD, y + PAD + 3, 19, COL.text, "right")
-
-    local cy = y + PAD + ENEMY_HEADER_H
-    local blockTop = cy
-    local eh = C.dispHP.enemy or en.hp or 0
-    local ef = math.max(0, math.min(1, eh / (en.maxhp or 1)))
-
-    local img = getSprite(en.species, C.dPoke)
-    if img then
-      local iw, ih = img:getDimensions(); local sc = (sp / math.max(iw, ih)) * s
-      setc(COL.text, eh <= 0 and 0.5 or 1)
-      -- Sprite faces the other way so the two Pokemon look at each other.
-      love.graphics.draw(img, math.floor((x + w - sp)*s), math.floor(blockTop*s), 0, sc, sc)
-    end
-
-    if en.types and #en.types > 0 then
-      local tx = x + PAD; for _, t in ipairs(en.types) do tx = tx + chip(tx, cy, t, TYPE[t] or COL.dim) end
-      cy = cy + 24
-    end
-    bar(x + PAD, cy, bodyW - PAD, 12, ef, hpCol(ef)); cy = cy + 18
-    txt(string.format("%d / %d HP", math.floor(eh + 0.5), en.maxhp or 0), x + PAD, cy, 19, COL.text, nil, 0.9)
-    cy = math.max(cy + 19, blockTop + sp) + 6
-
-    if m.speed and m.speed.faster then
-      local spTxt = m.speed.faster == "you" and "> You move first" or (m.speed.faster == "them" and "< Enemy moves first" or "= Speed tie")
-      txt(spTxt, x + PAD, cy, 16, COL.gold)
-    end
-    cy = cy + 20
-
-    local mf = 17
-    for i = 1, 4 do
-      local mv = en.moves and en.moves[i]
-      local my = cy + (i-1)*26
-      if mv then
-        local cx = x + PAD
-        if mv.type then cx = cx + chip(cx, my + 1, mv.type, TYPE[mv.type] or COL.dim) end
-        txt(mv.name .. (mv.stab and "  *" or ""), cx, my, mf, COL.text, nil, 0.95)
-        local pp = (mv.pp ~= nil and mv.maxpp ~= nil) and (mv.pp.."/"..mv.maxpp) or ""
-        if mv.mult ~= nil and not mv.status then
-          local tier = mv.mult == 0 and COL.lo or (mv.mult > 10 and COL.threat or (mv.mult == 10 and COL.dim or COL.resist))
-          txt(effText(mv.mult), x + w - PAD - 140, my, mf - 3, tier, "right")
-        end
-        local pw = effPower(mv)
-        txt((pw and (pw.." pow") or (mv.status and "STATUS" or "--")) .. "  ·  " .. pp, x + w - PAD, my, mf - 3, COL.text, "right")
-      else
-        txt("--", x + PAD, my, mf, COL.dim, nil, 0.5)
-        txt("--  ·  --", x + w - PAD, my, mf - 3, COL.dim, "right", 0.5)
-      end
-    end
-    return h
   end
 
   -- ---------------------------------------------------------------------
@@ -919,8 +846,8 @@ return function(mod)
     local edge = EDGE_MARGIN
     local dw, dh = W / s, H / s
 
-    -- Top-right HUD: game time/resets on top, badge row directly below.
-    -- Both always show; everything else toggles with O/F8.
+    -- Top right: game time + resets, badge row below, then repel and bag
+    -- hanging off the badge row's bottom edge. Always visible.
     local hudX = dw - edge - HUD_COLW
     gameTimePanel(st, hudX, edge)
     local badgeRowY = edge + GT_BOX_H + HUD_GAP
@@ -931,9 +858,7 @@ return function(mod)
       return
     end
 
-    -- Conditional boxes hang off the bottom of the badge row: bag flush
-    -- with its left edge, repel flush with its right edge.
-    bagPanel(st, hudX + BAG_BOX_W, condY)
+    bagPanel(st, hudX, condY)
     repelPanel(st, hudX + HUD_COLW - REPEL_BOX_W, condY)
 
     if not (st.party and #st.party > 0) then
@@ -941,20 +866,11 @@ return function(mod)
       return
     end
 
-    -- Left column: party info over stats, bottom-anchored so it sits level
-    -- with the enemy column on the right.
-    local statsY = dh - edge - STATS_PANEL_H
-    local m1 = (st.party or {})[1]
-    local partyH = m1 and partyPanelHeight(m1, 1) or 0
-    party(st, edge, statsY - PANEL_GAP - partyH, 1)
-    statsPanel(st, edge, statsY)
-
-    -- Right column: nothing out of battle; enemy info bottom-anchored to
-    -- exactly the same baseline as the player column.
+    -- Bottom left: your Pokemon. Bottom right: the enemy, battle only. Both
+    -- sit on the same baseline so the stat grids line up across the screen.
+    party(st, edge, dh - edge - PARTY_PANEL_H)
     if st.battle then
-      local rx = dw - edge - COLW
-      enemyStatsPanel(st, rx, statsY)
-      enemyPanel(st, rx, statsY - PANEL_GAP - ENEMY_PANEL_H)
+      enemyPanel(st, dw - edge - COLW, dh - edge - ENEMY_PANEL_H)
     end
     love.graphics.pop()
   end
