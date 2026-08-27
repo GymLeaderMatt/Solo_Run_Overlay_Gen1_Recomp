@@ -18,6 +18,27 @@ return function(mod)
   -- type matchup are baked into the number, rounded down at each step the
   -- way the real game does it. The star marks the same-type bonus.
   --
+  -- High-crit moves (Razor Leaf, Slash, Karate Chop, Crabhammer) have the
+  -- crit baked in too. Gen 1 ties the crit rate to BASE speed: 64+ crits
+  -- on 255 of 256 rolls, 32 is a coin flip, and the number shown is the
+  -- crit multiplier weighted by that chance.
+  -- Because a Gen 1 crit doubles the level inside the formula rather than
+  -- the damage, the multiplier is level-scaled -- about 1.8x at Lv20,
+  -- 1.95x at Lv100 -- not a flat 2x.
+  --
+  -- Accuracy is the real number, not the one printed on the move: your
+  -- accuracy drops and their evasion boosts are applied through the Gen 1
+  -- stage table (100 / 66 / 50 / 40 / 33 / 28 / 25) as two separate
+  -- clamped steps, the way MoveHitTest does it. It turns red when it's
+  -- been dragged down and green when it's been pushed up.
+  --
+  -- The green box is the move that actually does the most damage, not
+  -- just the one with the biggest number: it runs the engine's own damage
+  -- formula against the live battlers, so your stats and stages, their
+  -- defense and stages, badge boosts, burn, screens and the crit spread
+  -- all decide it. When that move kills from the enemy's current HP on
+  -- 98% or more of its damage range, the box lights up brighter.
+  --
   -- Your Pokemon's HP is a live number with a coloured dot beside it, since
   -- the game's own HUD already draws the bar. Green is full, yellow is hurt,
   -- red is 24% or less.
@@ -62,6 +83,13 @@ return function(mod)
   C.Stats    = C.Stats or req("src.pokemon.Stats")
   C.PaletteFX = C.PaletteFX or req("src.render.PaletteFX")
   C.Status   = C.Status or req("src.battle.Status")
+  -- The battle math below is the engine's own, not a second copy of it:
+  -- Damage exposes critRoll / accuracyThreshold / compute, MoveEffects
+  -- exposes the fixed-damage table, and the ruleset module is only the
+  -- fallback for reading crit rules outside a battle.
+  C.Damage      = C.Damage or req("src.battle.Damage")
+  C.MoveEffects = C.MoveEffects or req("src.battle.MoveEffects")
+  C.Ruleset0    = C.Ruleset0 or req("src.battle.rulesets.gen1_faithful")
   mod.events:on("game.ready", function(p) C.game = (p and p.game) or C.game end)
 
   -- ---------------------------------------------------------------------
@@ -75,6 +103,8 @@ return function(mod)
     border = hex("ffffff"), text = hex("ffffff"), dim = hex("b9bdc9"),
     xp = hex("5ab0ff"), gold = hex("ffd54a"), outline = hex("000000"),
     bestFill = hex("264a2c"), bestLine = hex("6ed278"),
+    -- Same green, lit up: the best move is also a near-certain kill.
+    koFill = hex("53a566"), koLine = hex("c8ffd0"),
     hpFull = hex("3cd25a"), hpHurt = hex("f5d232"), hpLow = hex("eb3c3c"),
   }
 
@@ -188,6 +218,245 @@ return function(mod)
   }
 
   -- ---------------------------------------------------------------------
+  -- Gen 1 battle math.
+  --
+  -- Everything here is answered BY the engine (src/battle/Damage.lua)
+  -- rather than reimplemented next to it, so a ruleset switch, a badge
+  -- boost, Focus Energy, or a mod that retunes a move all move the
+  -- overlay with them instead of quietly desyncing it.
+  -- ---------------------------------------------------------------------
+
+  -- Boosted-crit moves live in a table literally named HIGH_CRIT at the
+  -- top of src/battle/Damage.lua -- Karate Chop, Razor Leaf, Crabhammer,
+  -- Slash -- and a move record's own highCrit field (src/mods/Schemas.lua)
+  -- overrides it. That table is a local, so it can't be read directly;
+  -- isHighCrit interrogates the engine instead and only falls back to
+  -- this copy if the module isn't reachable.
+  local HIGH_CRIT_MOVES = {
+    KARATE_CHOP = true, RAZOR_LEAF = true, CRABHAMMER = true, SLASH = true,
+  }
+
+  -- Seismic Toss and friends carry a ROM power of 1, which makes the
+  -- power column read "1" and hides them from the best-move box. With
+  -- this on, they show what they actually do instead (your level, 20,
+  -- 40, half the target's HP). Flip it off to get the raw ROM number.
+  local SHOW_FIXED_DAMAGE_AS_POWER = true
+
+  -- 98%+ of the damage spread killing = the lighter box.
+  local KO_THRESHOLD = 0.98
+
+  local function activeRuleset(battle)
+    if battle and battle.ruleset then return battle.ruleset end
+    local g = C.game
+    local sel = g and g.save and g.save.options and g.save.options.ruleset
+    local rs = g and g.data and g.data.rulesets
+    return (sel and rs and rs[sel]) or C.Ruleset0 or {}
+  end
+
+  -- CriticalHitTest reduces to rand(0,255) < b. Damage.critRoll takes the
+  -- rng as an argument, so pinning the roll to a fixed value and binary
+  -- searching hands back b itself in 9 calls -- no copy of the shift
+  -- chain here, and critUsesBaseSpeed / the Focus Energy bug / a mod's
+  -- highCrit flag are all still the engine's answer. Chance is b/256.
+  local function critThreshold(ruleset, attacker, moveId, highCrit)
+    local D = C.Damage
+    if not (D and D.critRoll and attacker and attacker.def) then return nil end
+    local lo, hi = 0, 256
+    while lo < hi do
+      local mid = math.floor((lo + hi) / 2)
+      local ok, hit = pcall(D.critRoll, ruleset, attacker, moveId,
+                            function() return mid end, highCrit)
+      if not ok then return nil end
+      if hit then lo = mid + 1 else hi = mid end
+    end
+    return lo
+  end
+
+  -- A move is high-crit if its own threshold is the one the engine gives
+  -- a forced high-crit move and not the one it gives a normal move.
+  -- Move-intrinsic, so it's worked out once and cached.
+  local function isHighCrit(ruleset, attacker, moveId, md)
+    if md and md.highCrit ~= nil then return md.highCrit and true or false end
+    C.highCritCache = C.highCritCache or {}
+    local cached = C.highCritCache[moveId]
+    if cached ~= nil then return cached end
+    local bHigh = critThreshold(ruleset, attacker, moveId, true)
+    local bLow  = critThreshold(ruleset, attacker, moveId, false)
+    local bDef  = critThreshold(ruleset, attacker, moveId, nil)
+    local v
+    if bHigh and bLow and bDef and bHigh ~= bLow then
+      v = (bDef == bHigh)
+    else
+      v = HIGH_CRIT_MOVES[moveId] or false
+    end
+    C.highCritCache[moveId] = v
+    return v
+  end
+
+  -- A Gen 1 crit doubles the LEVEL inside the damage formula instead of
+  -- doubling the result, so the real multiplier is level-dependent:
+  -- (floor(4L/5)+2) / (floor(2L/5)+2). It climbs from 1.67x at Lv10 to
+  -- 1.8x at Lv20, 1.91x at Lv50 and 1.95x at Lv100 -- never quite 2x.
+  local function critRatio(level)
+    local base = math.floor(2 * (level or 1) / 5) + 2
+    local crit = math.floor(4 * (level or 1) / 5) + 2
+    if base <= 0 then return 2 end
+    return crit / base
+  end
+
+  -- What a crit is worth on average once you weigh it by how often it
+  -- lands: a high-crit move off 64+ base speed crits on 255 of 256 rolls,
+  -- so it's nearly the full multiplier; off 32 base speed it's half.
+  local function critFactorFor(level, chance)
+    if not chance then return nil end
+    return 1 + chance * (critRatio(level) - 1)
+  end
+
+  -- MoveHitTest's own threshold out of 256. This is where the Gen 1 stat
+  -- stage table comes in (data/battle/stat_modifiers.asm, applied by
+  -- Stats.applyStage: 100% at 0, then 66%, 50%, 40%, 33%, 28%, 25% going
+  -- down and 150%, 200%, 250%, 300%, 350%, 400% going up). Accuracy and
+  -- evasion are two separate clamped multiplications, not one combined
+  -- stage, and the 1/256 miss is in here too.
+  local function shownAccuracy(ruleset, move, attacker, defender)
+    local D = C.Damage
+    if not (D and D.accuracyThreshold and move and move.accuracy) then return nil end
+    if not (attacker and defender) then return nil end
+    local ok, thr = pcall(D.accuracyThreshold, ruleset, move, attacker, defender)
+    if not ok or type(thr) ~= "number" then return nil end
+    -- Rounded, so an untouched 100% move still reads 100 rather than the
+    -- 99.6 the 1/256 miss technically leaves it at.
+    return math.floor(thr * 100 / 256 + 0.5)
+  end
+
+  -- Every damage the move can roll against this defender. Damage.compute
+  -- applies its random factor as one floor(d * r / 255) at the very end,
+  -- so a single call with r pinned to 255 gives back the pre-random
+  -- damage and the other 38 rolls are arithmetic instead of 38 more
+  -- calls through the whole formula.
+  local function damageRolls(ruleset, atk, def, move, crit)
+    local D = C.Damage
+    if not (D and D.compute) then return nil end
+    local ok, d0 = pcall(D.compute, ruleset, atk, def, move,
+                         { forceCrit = crit and true or false,
+                           rng = function(_, b) return b end })
+    if not ok or type(d0) ~= "number" or d0 <= 0 then return nil end
+    if d0 <= 1 then return { math.max(1, d0) } end
+    local lo = ruleset.randMin or 217
+    local hi = ruleset.randMax or 255
+    local out = {}
+    for r = lo, hi do out[#out + 1] = math.max(1, math.floor(d0 * r / 255)) end
+    return out
+  end
+
+  -- SetDamageEffects (data/battle/set_damage_effects.asm): these skip
+  -- CalculateDamage, the type chart and the random factor completely, so
+  -- they can't go through Damage.compute at all. OHKO moves are left
+  -- out on purpose -- they're a 30%-accuracy coin flip, not a damage
+  -- roll, and treating them as a guaranteed kill would be a lie.
+  local function fixedDamageRolls(md, moveId, attacker, defender)
+    local spec = md.fixedDamage
+    if spec == nil then
+      local FD = C.MoveEffects and C.MoveEffects.FIXED_DAMAGE
+      spec = FD and FD[moveId]
+    end
+    local lvl = (attacker and attacker.mon and attacker.mon.level) or 1
+    if spec == "level" then return { lvl } end
+    if spec == "half_level_rand" then
+      local mx = math.max(1, math.floor(lvl * 3 / 2) - 1)
+      local o = {}
+      for v = 1, mx do o[#o + 1] = v end
+      return o
+    end
+    if type(spec) == "number" then return { spec } end
+    if md.effect == "SUPER_FANG_EFFECT" then
+      -- needs a target, so it stays blank out of battle
+      local hp = defender and defender.mon and defender.mon.hp
+      if not hp then return nil end
+      return { math.max(1, math.floor(hp / 2)) }
+    end
+    return nil
+  end
+
+  -- The single number the power column should show for a fixed-damage
+  -- move (an average, which only matters for Psywave's spread).
+  local function fixedDamageShown(md, moveId, attacker, defender)
+    local fx = fixedDamageRolls(md, moveId, attacker, defender)
+    if not fx then return nil end
+    local sum = 0
+    for _, v in ipairs(fx) do sum = sum + v end
+    return math.floor(sum / #fx + 0.5)
+  end
+
+  -- How many times the move connects, as a distribution.
+  local function hitDistribution(md)
+    local dist = md.multiHit
+    if dist == nil then
+      local e = md.effect
+      if e == "TWO_TO_FIVE_ATTACKS_EFFECT" then dist = { 2, 2, 2, 3, 3, 3, 4, 5 }
+      elseif e == "ATTACK_TWICE_EFFECT" or e == "TWINEEDLE_EFFECT" then dist = 2 end
+    end
+    if type(dist) == "number" then return { [dist] = 1 } end
+    if type(dist) == "table" and #dist > 0 then
+      local out, w = {}, 1 / #dist
+      for _, n in ipairs(dist) do out[n] = (out[n] or 0) + w end
+      return out
+    end
+    return { [1] = 1 }
+  end
+
+  -- One hit's damage as value -> probability, folding the crit roll in.
+  local function hitSpread(rollsNC, rollsC, p)
+    local acc = {}
+    local function add(list, w)
+      if not list or #list == 0 or w <= 0 then return end
+      local each = w / #list
+      for _, v in ipairs(list) do acc[v] = (acc[v] or 0) + each end
+    end
+    if not rollsC or not p then
+      add(rollsNC, 1)
+    else
+      add(rollsNC, 1 - p)
+      add(rollsC, p)
+    end
+    return acc
+  end
+
+  -- Average total damage, and the share of the spread that reaches the
+  -- target's CURRENT HP. Multi-hit moves roll damage and crit per hit,
+  -- so the totals are convolved rather than just multiplied; everything
+  -- at or past the target's HP collapses into one absorbing bucket, which
+  -- keeps the table the size of the target's HP no matter how many hits.
+  -- Accuracy deliberately isn't in this number: it's how much of the
+  -- damage range kills, not how often the move lands.
+  local function damageOutcome(spread, hitDist, targetHP)
+    local ev = 0
+    for v, pr in pairs(spread) do ev = ev + v * pr end
+    local eh, maxN = 0, 0
+    for n, w in pairs(hitDist) do
+      eh = eh + n * w
+      if n > maxN then maxN = n end
+    end
+    local avg = ev * eh
+    if not targetHP or targetHP < 1 then return avg, nil end
+    local ko, cur = 0, { [0] = 1 }
+    for n = 1, maxN do
+      local nxt = {}
+      for v, pv in pairs(cur) do
+        for d, pd in pairs(spread) do
+          local nv = v + d
+          if nv > targetHP then nv = targetHP end
+          nxt[nv] = (nxt[nv] or 0) + pv * pd
+        end
+      end
+      cur = nxt
+      local w = hitDist[n]
+      if w then ko = ko + w * (cur[targetHP] or 0) end
+    end
+    return avg, ko
+  end
+
+  -- ---------------------------------------------------------------------
   -- Reads the save data into something easy to draw.
   -- ---------------------------------------------------------------------
   local function currentBattle()
@@ -251,17 +520,40 @@ return function(mod)
     for i, mon in ipairs(save.party or {}) do
       local def = dPoke[mon.species]
       local raw = (def and def.types) or {}
+      -- Crit only gets folded into the lead's moves, since it's the only
+      -- set that's drawn. Out of battle there's no battler to ask, so a
+      -- stand-in carrying the same fields critRoll reads is used instead
+      -- -- base speed is all the Gen 1 rule actually wants.
+      local ruleset = activeRuleset(battle)
+      local selfBattler = (battle and battle.player and battle.player.mon == mon
+                           and battle.player)
+        or { mon = mon, def = def, curStats = mon.stats, curTypes = raw, stages = {} }
+
       local moves = {}
       for _, mv in ipairs(mon.moves or {}) do
         local md = dMove[mv.id]
         local pow = md and md.power or 0
+        local isStatus = md and ((md.category == "status") or pow == 0) or nil
+        local high, critChance, critFactor, fixedPow
+        if i == 1 and md and not isStatus and def and def.baseStats then
+          high = isHighCrit(ruleset, selfBattler, mv.id, md)
+          if high then
+            local b = critThreshold(ruleset, selfBattler, mv.id, md.highCrit)
+            critChance = b and (b / 256) or nil
+            critFactor = critFactorFor(mon.level, critChance)
+          end
+          -- so a level-based move reads the same out of battle as in one
+          fixedPow = fixedDamageShown(md, mv.id, selfBattler, nil)
+        end
         moves[#moves+1] = {
           name = (md and md.name) or mv.id, pp = mv.pp, maxpp = md and md.pp,
           type = md and md.type and C.TypeChart and C.TypeChart.displayName(md.type) or nil,
           power = pow > 0 and pow or nil,
           accuracy = md and md.accuracy,
-          status = md and ((md.category == "status") or pow == 0) or nil,
+          status = isStatus,
           stab = (md and md.type and hasType(raw, md.type)) or nil,
+          highCrit = high or nil, critChance = critChance, critFactor = critFactor,
+          fixedDamage = fixedPow,
         }
       end
       if #raw > 0 then teamTypes[#teamTypes+1] = raw end
@@ -330,8 +622,11 @@ return function(mod)
       if C.TypeChart and pMon and eMon then
         if not C.tcReady then C.tcReady = pcall(C.TypeChart.load, data) end
         local ok, res = pcall(function()
-          local eff, disp, cat = C.TypeChart.effectiveness, C.TypeChart.displayName, C.TypeChart.category
+          local eff, disp = C.TypeChart.effectiveness, C.TypeChart.displayName
           local function has(l,t) for _,x in ipairs(l) do if x==t then return true end end return false end
+          local atkB, defB = battle.player, battle.enemy
+          local ruleset = activeRuleset(battle)
+          local enemyHP = eMon and eMon.hp
           local myMoves, bi, bs = {}, nil, -1
           for _, mv in ipairs(pMon.moves or {}) do
             local md = dMove[mv.id]
@@ -339,13 +634,52 @@ return function(mod)
               local pow = md.power or 0
               local st = (md.category == "status") or pow == 0
               local mult = eff(md.type, enTypes); local stab = has(myTypes, md.type)
-              myMoves[#myMoves+1] = { name = md.name or mv.id, type = disp(md.type),
+              -- Each TypeEffects row floors separately, so the rows
+              -- themselves are what the power column needs, not the
+              -- combined multiplier.
+              local okRows, rows = pcall(C.TypeChart.rows, md.type, enTypes)
+              local e = { name = md.name or mv.id, type = disp(md.type),
                 power = pow > 0 and pow or nil, pp = mv.pp, maxpp = md.pp,
-                mult = mult, stab = stab or nil, status = st or nil }
-              if not st and mult > 0 then local sc = mult*pow*(stab and 15 or 10); if sc > bs then bs=sc; bi=#myMoves end end
+                mult = mult, stab = stab or nil, status = st or nil,
+                rows = okRows and rows or nil }
+              e.accShown = shownAccuracy(ruleset, md, atkB, defB)
+
+              -- The best-move box is decided on real damage now, not on a
+              -- power proxy: Damage.compute against the live battlers, so
+              -- your stat stages and badge boosts, their defense and
+              -- stages, burn, Reflect/Light Screen and the Gen 1
+              -- crit-ignores-stages quirk are all inside the number.
+              if not st then
+                local fixed = fixedDamageRolls(md, mv.id, atkB, defB)
+                local spread, hits
+                if fixed then
+                  local sum = 0
+                  for _, v in ipairs(fixed) do sum = sum + v end
+                  e.fixedDamage = math.floor(sum / #fixed + 0.5)
+                  spread, hits = hitSpread(fixed, nil, nil), { [1] = 1 }
+                elseif mult > 0 then
+                  local b = critThreshold(ruleset, atkB, mv.id, md.highCrit)
+                  local p = b and (b / 256) or nil
+                  local nc = damageRolls(ruleset, atkB, defB, md, false)
+                  local cr = (p and p > 0) and damageRolls(ruleset, atkB, defB, md, true) or nil
+                  if nc then
+                    spread = hitSpread(nc, cr, cr and p or nil)
+                    hits = hitDistribution(md)
+                  end
+                end
+                if spread then
+                  local avg, ko = damageOutcome(spread, hits, enemyHP)
+                  e.avgDamage, e.koChance = avg, ko
+                  if avg > bs then bs = avg; bi = #myMoves + 1 end
+                end
+              end
+              myMoves[#myMoves+1] = e
             end
           end
-          if bi then myMoves[bi].best = true end
+          if bi then
+            myMoves[bi].best = true
+            myMoves[bi].koLikely = ((myMoves[bi].koChance or 0) >= KO_THRESHOLD) or nil
+          end
           local enemyMoves = {}
           for _, mv in ipairs(eMon.moves or {}) do
             local md = dMove[mv.id]
@@ -392,7 +726,12 @@ return function(mod)
        and party[1] and party[1].moves then
       for i, mv in ipairs(party[1].moves) do
         local em = battleBlock.matchup.myMoves[i]
-        if em then mv.mult = em.mult; mv.stab = em.stab; mv.best = em.best end
+        if em then
+          mv.mult = em.mult; mv.stab = em.stab; mv.best = em.best
+          mv.rows = em.rows; mv.accShown = em.accShown
+          mv.avgDamage = em.avgDamage; mv.koChance = em.koChance
+          mv.koLikely = em.koLikely; mv.fixedDamage = em.fixedDamage
+        end
       end
     end
 
@@ -692,15 +1031,31 @@ return function(mod)
   end
   local function effPower(mv)
     if not (mv and mv.power) then return nil end
+    -- Seismic Toss and friends never touch the power formula at all, so
+    -- their ROM power of 1 means nothing; show what they actually do.
+    if SHOW_FIXED_DAMAGE_AS_POWER and mv.fixedDamage then return mv.fixedDamage end
     local p = mv.power
+    -- A high-crit move's crit isn't a bonus, it's what the move is, so
+    -- it's folded straight into the power the same way the same-type
+    -- bonus is. It goes in FIRST because the level term it really
+    -- multiplies sits ahead of the same-type bonus and the type rows in
+    -- the real formula. The multiplier is the level-scaled crit ratio
+    -- weighted by the actual chance to crit -- off 64+ base speed that's
+    -- 255 of 256 rolls, so almost all of it lands; off 32 base speed
+    -- it's half of it.
+    if mv.critFactor and mv.critFactor > 1 then p = p * mv.critFactor end
     if mv.stab then p = math.floor(p * 3 / 2) end
-    local m = mv.mult
-    if m == 2 then
-      p = math.floor(math.floor(p * 5 / 10) * 5 / 10)
-    elseif m then
-      p = math.floor(p * m / 10)
+    if mv.rows then
+      for _, m in ipairs(mv.rows) do p = math.floor(p * m / 10) end
+    else
+      local m = mv.mult
+      if m == 2 then
+        p = math.floor(math.floor(p * 5 / 10) * 5 / 10)
+      elseif m then
+        p = math.floor(p * m / 10)
+      end
     end
-    return p
+    return math.floor(p + 0.5)
   end
 
   -- ---------------------------------------------------------------------
@@ -823,7 +1178,7 @@ return function(mod)
       -- value locks to one size/outline weight instead of drifting per
       -- value, and it uses the same weight/extraPx as the enemy's normal
       -- tier so both sides read at the same outline thickness.
-      local vszRef = h*0.38
+      local vszRef = h*0.48
       while textW("99", vszRef) > w - 20 and vszRef > 16 do vszRef = vszRef - 1 end
       local vsz, extraPx = vszRef, 1
       if textW(value, vszRef) > w - 20 then
@@ -969,37 +1324,71 @@ return function(mod)
     local moveIconSz = 28
     local ppR = mR
     local accR = ppR - 40
-    -- Well clear of accuracy now, not just a few px off it -- "100" and
-    -- "100%" no longer come anywhere near touching.
-    local powR = accR - 80
-    local nameL = mL + moveIconSz + 8
-    local nameMax = powR - 46 - nameL
+    -- Well clear of accuracy, not just a few px off it -- "100" and
+    -- "100%" still don't come near touching. Six px tighter than it was
+    -- to pay for the wider power column below without costing the move
+    -- names any room; there was over 20px of slack here.
+    local powR = accR - 74
+    -- The three number columns are CENTERED rather than right-aligned.
+    -- Right-aligning them meant a 1-digit value and a 3-digit one sat on
+    -- different sides of the same column, which reads as a wobble down
+    -- the list. Each column keeps exactly the right edge it always had --
+    -- measured against its own widest value, so nothing moved -- and
+    -- everything shorter now centers under that instead of hanging off it.
+    local ppC  = ppR - textW("00", 20) / 2
+    local accC = accR - textW("100%", 17) / 2
+    local powC = powR - textW("000", MOVE_SIZE) / 2
+    -- The best move's power reads a size larger. The name column reserves
+    -- room for the BUMPED width at all times, so a move going green never
+    -- shoves its own name around.
+    local BEST_BUMP = 3
+    local powHalfMax = textW("000", MOVE_SIZE + BEST_BUMP) / 2
+    local nameL = mL + moveIconSz + 4
+    local nameMax = (powC - powHalfMax) - 4 - nameL
     for i = 1, 4 do
       local mv = m.moves and m.moves[i]
       local ry = mby + 6 + (i-1)*MOVE_ROW
       local cy = ry + MOVE_ROW/2
       if mv then
         if mv.best then
-          setc(COL.bestFill, 1); rrect("fill", mL - 4, ry + 2, (mR - mL) + 8, MOVE_ROW - 4, 8)
-          love.graphics.setLineWidth(math.max(1, 1.8*s))
-          setc(COL.bestLine, 1); rrect("line", mL - 4, ry + 2, (mR - mL) + 8, MOVE_ROW - 4, 8)
+          -- Same green either way; it just lights up once this move is a
+          -- near-certain kill on the enemy's current HP. A hair taller
+          -- than the row it sits in -- 2px of gap left between boxes, so
+          -- it can't touch the row above or below.
+          local fill = mv.koLikely and COL.koFill or COL.bestFill
+          local line = mv.koLikely and COL.koLine or COL.bestLine
+          setc(fill, 1); rrect("fill", mL - 5, ry + 1, (mR - mL) + 10, MOVE_ROW - 2, 8)
+          love.graphics.setLineWidth(math.max(1, (mv.koLikely and 2.4 or 1.8)*s))
+          setc(line, 1); rrect("line", mL - 5, ry + 1, (mR - mL) + 10, MOVE_ROW - 2, 8)
         end
         if mv.type then typeIcon(mv.type, mL, cy - moveIconSz/2, moveIconSz) end
         local pw = effPower(mv)
         local nm = mv.name .. ((pw and mv.stab) and " *" or "")
         txtMid(ellipsize(nm, MOVE_SIZE, nameMax), nameL, cy, MOVE_SIZE)
-        txtMid(pw and tostring(pw) or "\226\128\148", powR, cy, MOVE_SIZE, COL.text, "right")
-        local accStr = mv.accuracy and (tostring(mv.accuracy) .. "%") or "--"
-        txtMid(accStr, accR, cy, 17, COL.dim, "right")
+        local powSz = mv.best and (MOVE_SIZE + BEST_BUMP) or MOVE_SIZE
+        txtMid(pw and tostring(pw) or "\226\128\148", powC, cy, powSz, COL.text, "center")
+        -- Accuracy after your accuracy drops and their evasion boosts,
+        -- not the flat number on the move. Red is reserved for when the
+        -- move is genuinely a coin flip -- 50% or worse -- rather than
+        -- for any drop at all, which would just be restating that a Sand
+        -- Attack landed. Green is the rare other direction (X Accuracy).
+        local shown = mv.accShown or mv.accuracy
+        local accStr = shown and (tostring(shown) .. "%") or "--"
+        local accCol = COL.dim
+        if shown then
+          if shown <= 50 then accCol = COL.hpLow
+          elseif mv.accuracy and shown > mv.accuracy then accCol = COL.hpFull end
+        end
+        txtMid(accStr, accC, cy, 17, accCol, "center")
         -- Just the current count now, not "current/max" -- saves a lot of
         -- horizontal room. Reads dark red once you're down to 3 PP or less.
         local pp = mv.pp ~= nil and tostring(mv.pp) or "--"
         local ppCol = (mv.pp ~= nil and mv.pp <= 3) and COL.hpLow or COL.text
-        txtMid(pp, ppR, cy, 20, ppCol, "right")
+        txtMid(pp, ppC, cy, 20, ppCol, "center")
       else
         txtMid("\226\128\148", nameL, cy, MOVE_SIZE, COL.dim)
-        txtMid("\226\128\148", accR, cy, 17, COL.dim, "right")
-        txtMid("\226\128\148", ppR, cy, 20, COL.dim, "right")
+        txtMid("\226\128\148", accC, cy, 17, COL.dim, "center")
+        txtMid("\226\128\148", ppC, cy, 20, COL.dim, "center")
       end
     end
 
