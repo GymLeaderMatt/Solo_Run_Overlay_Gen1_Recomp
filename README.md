@@ -9,7 +9,7 @@ https://discord.com/channels/1019387038820216882/1530767978092560474
 # Solo Run Overlay
 
 - This adds an overlay similar to the videos I used but converted to the gen 1 recomp. This is designed for solo run play in mind and designed for my own personal use.
-- 
+
 <img width="1919" height="1079" alt="upload2" src="https://github.com/user-attachments/assets/0893960c-feb6-4db2-96f0-3688b5efb99d" />
 
 # DISCLAIMER
