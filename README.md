@@ -16,6 +16,7 @@ https://discord.com/channels/1019387038820216882/1530767978092560474
 
 - This mod is dependent on the Badge Boost Glitch mod I made. Link below.
 - https://github.com/GymLeaderMatt/Badge-Boost-Glitch
+- NOTE: This is the standalone mod. These days I suggest the 'solo run modpack' and turn on the badge boost option in the mod menu.
 - This mod was also designed with the Voxel Rendering mod in mind.
 - It probably will not be correct if you don't use that.
 
@@ -28,13 +29,14 @@ https://discord.com/channels/1019387038820216882/1530767978092560474
 - Pressing 'o' will enable other information.
 
 # Your Pokemon
-- Displays all of the information like species, type, hp, experience, growth rate, moves, effective power, and stats.\
+- Displays all of the information like species, type, hp, experience, growth rate, moves, effective power, and stats.
 - Stats live update with stat stages, badge boosts, badge boost glitch, burn, paralysis, etc.
+- Damaging moves will be highlighted. The highest damaging move will be calculated looking at the power, your stats, the enemy stats, etc.
+- Default is a darker green but if it is a lighter green, it denotes a 98%+ knock out chance.
 
 # Enemy Pokemon
-- Only appears during battle but shows all of the relevant information like HP, moves, and stats.
+- Simplified to just show the stats, sprite, and stats.
 - Stats also live update for the opponent as well.
-- Indicator above moves to show if you outspeed at a glance.
 
 # Bags/Repels
 - Conditionally, two indicators will appear: Repel count and a bag fullness indicator.
