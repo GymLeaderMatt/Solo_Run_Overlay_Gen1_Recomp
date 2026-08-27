@@ -134,6 +134,43 @@ return function(mod)
     C.sprites[cacheKey] = img
     return img or nil
   end
+  -- Battle sprite art isn't cropped to the creature -- most species have
+  -- real empty margin on one or more sides of their canvas (small/low
+  -- Pokemon especially), so centering the FULL canvas in a box centers the
+  -- padding, not the creature, and it reads as "off in a corner." This
+  -- scans the actual opaque pixels once per species and caches the tight
+  -- box around them, so fitImg can center and size against the creature
+  -- itself instead of its canvas.
+  C.spriteBounds = C.spriteBounds or {}
+  local function getSpriteBounds(speciesId, dPoke)
+    if C.spriteBounds[speciesId] ~= nil then return C.spriteBounds[speciesId] or nil end
+    local def = dPoke[speciesId]
+    local rel = def and def.spriteFront
+    local b = false
+    if rel and love.image and love.image.newImageData then
+      local ok, id = pcall(love.image.newImageData, rel)
+      if ok and id then
+        local iw, ih = id:getDimensions()
+        local minX, minY, maxX, maxY = iw, ih, -1, -1
+        for py = 0, ih - 1 do
+          for px = 0, iw - 1 do
+            local _, _, _, a = id:getPixel(px, py)
+            if a > 0.05 then
+              if px < minX then minX = px end
+              if py < minY then minY = py end
+              if px > maxX then maxX = px end
+              if py > maxY then maxY = py end
+            end
+          end
+        end
+        if maxX >= 0 then
+          b = { x0 = minX, y0 = minY, w = maxX + 1 - minX, h = maxY + 1 - minY }
+        end
+      end
+    end
+    C.spriteBounds[speciesId] = b
+    return b or nil
+  end
   -- Separate cache for this mod's own icons (badges, bag, types, statuses, speed).
   C.uiImages = C.uiImages or {}
   local function uiImage(path)
@@ -222,6 +259,7 @@ return function(mod)
           name = (md and md.name) or mv.id, pp = mv.pp, maxpp = md and md.pp,
           type = md and md.type and C.TypeChart and C.TypeChart.displayName(md.type) or nil,
           power = pow > 0 and pow or nil,
+          accuracy = md and md.accuracy,
           status = md and ((md.category == "status") or pow == 0) or nil,
           stab = (md and md.type and hasType(raw, md.type)) or nil,
         }
@@ -242,6 +280,7 @@ return function(mod)
         types = dispTypes(raw), moves = moves, exp = mon.exp,
         xpProgress = xpProg, xpToNext = xpNext,
         growthRate = def and def.growthRate,
+        ability = def and def.ability,
         stats = mon.stats,
         badgeStat = playerBadgeStat,
         baseSpeed = def and def.baseStats and def.baseStats.speed,
@@ -443,25 +482,45 @@ return function(mod)
   end
   local function textW(str, size) return getFont(size*s):getWidth(sanitize(str)) / s end
   -- Everything is white on black, so every string gets a black outline drawn
-  -- around it. Four passes reads as cleanly as eight at these sizes.
+  -- around it. Four passes (cardinal directions only) reads as cleanly as
+  -- eight at these sizes -- true for the original thin outline, but a
+  -- thickened one (extraPx) needs the diagonals too, or the four cardinal
+  -- strokes don't quite meet at each glyph's corners. That gap is exactly
+  -- what read as a soft blurry "shadow" instead of a crisp edge: four
+  -- rings stacked outward (to fill the gap between glyph and outline)
+  -- still all share the same four missing corners, so the notch just got
+  -- restated at each ring instead of going away.
   local OUTLINE_OFF = { {-1,0}, {1,0}, {0,-1}, {0,1} }
-  local function txt(str, x, y, size, col, align, weight)
+  local OUTLINE_OFF8 = { {-1,0}, {1,0}, {0,-1}, {0,1}, {-1,-1}, {1,-1}, {-1,1}, {1,1} }
+  local function txt(str, x, y, size, col, align, weight, extraPx, skipOutline)
     str = sanitize(str)
     local f = getFont(size*s); love.graphics.setFont(f)
     local X = x*s
     if align == "right" then X = X - f:getWidth(str)
     elseif align == "center" then X = X - f:getWidth(str)/2 end
     X, y = math.floor(X), math.floor(y*s)
-    local o = math.max(1, math.floor((weight or 0.07) * size * s + 0.5))
-    setc(COL.outline, 1)
-    for i = 1, #OUTLINE_OFF do
-      love.graphics.print(str, X + OUTLINE_OFF[i][1]*o, y + OUTLINE_OFF[i][2]*o)
+    if not skipOutline then
+      -- extraPx is a literal pixel bump on top of the scaled weight, for
+      -- spots that need a visibly thicker stroke regardless of resolution.
+      local o = math.max(1, math.floor((weight or 0.07) * size * s + 0.5)) + (extraPx or 0)
+      setc(COL.outline, 1)
+      -- A thickened outline (extraPx set) fills solid from 1px out to o
+      -- using all 8 directions, so both the ring-gap and the corner-notch
+      -- are gone.
+      local thick = extraPx and extraPx > 0
+      local offs = thick and OUTLINE_OFF8 or OUTLINE_OFF
+      local fromD = thick and 1 or o
+      for d = fromD, o do
+        for i = 1, #offs do
+          love.graphics.print(str, X + offs[i][1]*d, y + offs[i][2]*d)
+        end
+      end
     end
     setc(col or COL.text, 1)
     love.graphics.print(str, X, y)
   end
-  local function txtMid(str, x, y, size, col, align, weight)
-    txt(str, x, y - size*0.62, size, col, align, weight)
+  local function txtMid(str, x, y, size, col, align, weight, extraPx, skipOutline)
+    txt(str, x, y - size*0.62, size, col, align, weight, extraPx, skipOutline)
   end
   local function ellipsize(str, size, maxW)
     if textW(str, size) <= maxW then return str end
@@ -488,12 +547,68 @@ return function(mod)
     love.graphics.draw(img, math.floor(x*s + (size*s - iw*sc)/2),
       math.floor(y*s + (size*s - ih*sc)/2), 0, sc, sc)
   end
-  local function fitImg(img, x, y, w, h, flip)
+  -- One-texel silhouette shader for the "outline both sprites" pass: it
+  -- paints solid white exactly where a transparent source pixel borders an
+  -- opaque one, and stays transparent everywhere else (including the
+  -- sprite's own interior, which the normal draw handles on top of it).
+  -- Sized in source-image texels rather than screen pixels, so it comes out
+  -- one game-pixel thick at any resolution, matching the pixel-art grid.
+  local function getSpriteOutlineShader()
+    if C.spriteOutlineShader == nil then
+      local ok, sh = pcall(love.graphics.newShader, [[
+        extern vec2 texel;
+        vec4 effect(vec4 color, Image tex, vec2 uv, vec2 screen_coords) {
+          vec4 c = Texel(tex, uv);
+          if (c.a > 0.15) { return vec4(0.0); }
+          float a = 0.0;
+          a = max(a, Texel(tex, uv + vec2( texel.x, 0.0)).a);
+          a = max(a, Texel(tex, uv + vec2(-texel.x, 0.0)).a);
+          a = max(a, Texel(tex, uv + vec2(0.0,  texel.y)).a);
+          a = max(a, Texel(tex, uv + vec2(0.0, -texel.y)).a);
+          a = max(a, Texel(tex, uv + vec2( texel.x,  texel.y)).a);
+          a = max(a, Texel(tex, uv + vec2(-texel.x,  texel.y)).a);
+          a = max(a, Texel(tex, uv + vec2( texel.x, -texel.y)).a);
+          a = max(a, Texel(tex, uv + vec2(-texel.x, -texel.y)).a);
+          return vec4(1.0, 1.0, 1.0, a);
+        }
+      ]])
+      C.spriteOutlineShader = ok and sh or false
+    end
+    return C.spriteOutlineShader or nil
+  end
+
+  -- bounds (optional, from getSpriteBounds) makes this center and size
+  -- against the creature's actual opaque pixels instead of its full
+  -- canvas -- most sprites have real empty margin on the canvas, which
+  -- otherwise reads as the creature sitting off in a corner.
+  local function fitImg(img, x, y, w, h, flip, outline, bounds)
     if not img then return end
     local iw, ih = img:getDimensions()
-    local sc = math.min(w*s / iw, h*s / ih)
-    local ox = math.floor(x*s + (w*s - iw*sc)/2)
-    local oy = math.floor(y*s + (h*s - ih*sc)/2)
+    local cx0, cy0, cw, ch = 0, 0, iw, ih
+    if bounds then cx0, cy0, cw, ch = bounds.x0, bounds.y0, bounds.w, bounds.h end
+    local sc = math.min(w*s / cw, h*s / ch)
+    local oy = math.floor(y*s + (h*s - ch*sc)/2 - cy0*sc)
+    local ox
+    if flip then
+      -- Flipping mirrors the canvas around its own right edge, so the
+      -- content's effective offset becomes its margin measured from the
+      -- RIGHT of the canvas, not the left.
+      local xR = iw - (cx0 + cw)
+      ox = math.floor(x*s + (w*s - cw*sc)/2 - xR*sc)
+    else
+      ox = math.floor(x*s + (w*s - cw*sc)/2 - cx0*sc)
+    end
+    if outline then
+      local sh = getSpriteOutlineShader()
+      if sh then
+        sh:send("texel", {1/iw, 1/ih})
+        love.graphics.setShader(sh)
+        setc(COL.text, 1)
+        if flip then love.graphics.draw(img, ox + iw*sc, oy, 0, -sc, sc)
+        else love.graphics.draw(img, ox, oy, 0, sc, sc) end
+        love.graphics.setShader()
+      end
+    end
     setc(COL.text, 1)
     if flip then love.graphics.draw(img, ox + iw*sc, oy, 0, -sc, sc)
     else love.graphics.draw(img, ox, oy, 0, sc, sc) end
@@ -505,7 +620,7 @@ return function(mod)
     if img then
       drawImg(img, x, y, size)
       love.graphics.setLineWidth(math.max(1, 3.2*s))
-      setc(COL.border, 1)
+      setc(COL.outline, 1)
       love.graphics.circle("line", math.floor((x + size/2)*s), math.floor((y + size/2)*s),
         (size/2 - size*0.025)*s, 48)
     else
@@ -514,28 +629,33 @@ return function(mod)
     end
     return size
   end
-  -- Status art carries its own black outline, so it needs a plate to sit on.
-  local function iconPlate(path, x, y, size, pad)
-    pad = pad or 4
-    local box = size + pad*2
-    setc(COL.plate, 1); rrect("fill", x, y, box, box, box*0.28)
-    love.graphics.setLineWidth(math.max(1, 2.2*s))
-    setc(COL.border, 1); rrect("line", x, y, box, box, box*0.28)
-    drawImg(uiImage(path), x + pad, y + pad, size)
-    return box
+  -- Speed comparison badge: the original green/red/yellow speed/*.png art,
+  -- outlined the same way the battle sprites are -- a thin white trace of
+  -- the icon's own silhouette (fitImg's outline pass) rather than a ring
+  -- around it. No circle backdrop.
+  local function speedBadge(kind, x, y, size)
+    local img = uiImage(mod.assets:path("assets/speed/" .. kind .. ".png"))
+    if not img then return end
+    fitImg(img, x, y, size, size, false, true)
   end
-  local function statusIcons(m, x, y, size, rightToLeft)
-    local list = {}
-    if m.status and STATUS_ICON[m.status] then list[#list+1] = STATUS_ICON[m.status] end
-    if m.confusedTurns then list[#list+1] = "confuse" end
-    if #list == 0 then return 0 end
-    local box = size + 8
-    local cx = x
-    if rightToLeft then cx = x - (#list * (box + 6) - 6) end
-    for _, nm in ipairs(list) do
-      cx = cx + iconPlate(mod.assets:path("assets/status/" .. nm .. ".png"), cx, y, size) + 6
-    end
-    return #list
+  -- Single status slot (used on both sides now): draws NOTHING -- no box,
+  -- no outline -- when there's no status to show, rather than a permanent
+  -- empty placeholder. Confusion is a temporary overlay -- it takes
+  -- priority for display over a lingering primary status (sleep, burn,
+  -- etc.), which comes back into view once confusion wears off.
+  local function primaryStatus(m)
+    if m.confusedTurns then return "confuse" end
+    if m.status and STATUS_ICON[m.status] then return STATUS_ICON[m.status] end
+    return nil
+  end
+  local function statusBox(x, y, size, m)
+    local nm = primaryStatus(m)
+    if not nm then return end
+    setc(COL.plate, 1); rrect("fill", x, y, size, size, size*0.28)
+    love.graphics.setLineWidth(math.max(1, 2.2*s))
+    setc(COL.border, 1); rrect("line", x, y, size, size, size*0.28)
+    local pad = math.floor(size*0.14)
+    drawImg(uiImage(mod.assets:path("assets/status/" .. nm .. ".png")), x + pad, y + pad, size - pad*2)
   end
   local function bar(x, y, w, h, frac, col)
     setc(COL.panel, 1); rrect("fill", x, y, w, h, h/2)
@@ -543,6 +663,21 @@ return function(mod)
     setc(COL.border, 1); rrect("line", x, y, w, h, h/2)
     if frac and frac > 0 then
       setc(col, 1)
+      rrect("fill", x + 2, y + 2, math.max(3, (w - 4)*math.min(1, frac)), h - 4, (h-4)/2)
+    end
+  end
+  -- Solid hot pink fill over a dark-almost-black-pink track (not a
+  -- gradient of the fill itself -- that was a misread of "pink" last
+  -- round). The track color is what shows through on the unfilled portion
+  -- while you're still gaining XP.
+  local XP_FILL = { 1.0, 0.13, 0.58 }
+  local XP_BG   = { 0.12, 0.02, 0.08 }
+  local function xpBar(x, y, w, h, frac)
+    setc(XP_BG, 1); rrect("fill", x, y, w, h, h/2)
+    love.graphics.setLineWidth(math.max(1, 1.6*s))
+    setc(COL.border, 1); rrect("line", x, y, w, h, h/2)
+    if frac and frac > 0 then
+      setc(XP_FILL, 1)
       rrect("fill", x + 2, y + 2, math.max(3, (w - 4)*math.min(1, frac)), h - 4, (h-4)/2)
     end
   end
@@ -578,16 +713,38 @@ return function(mod)
   local PAD = 16
   local GAP = 12
 
-  local SPRITE_BOX = 186  -- player's sprite box, square
-  local NAME_SIZE = 34    -- fixed, sized against VICTREEBEL / NIDOQUEEN
+  -- Compact header strip: sprite (no background box -- just the outlined
+  -- silhouette, filling the full row height), name/level, growth rate, XP
+  -- bar. About 40% shorter than the old sprite-box layout. Kept tight
+  -- enough (with MOVE_ROW/STAT_H trimmed too) that the whole panel fits
+  -- above the screen bottom while still top-anchored to line up with the
+  -- game's FIGHT/ITEM/RUN box -- it doesn't get to grow past that.
+  local INFO_H = 120      -- gives the header row enough room for even
+                           -- growth-rate/bar/xp-text spacing without touching
+  local NAME_SIZE = 34    -- ceiling; auto-shrinks down to fit the full name
   local MOVE_SIZE = 22    -- fixed, sized against SEISMIC TOSS *
-  local MOVE_ROW = 52
-  local STAT_H = 108
-  local MOVEBOX_H = 12 + 4*MOVE_ROW + 12
+  local MOVE_ROW = 26
+  local STAT_H = 88
+  -- Tight top inset (moves sit right under the box's own top edge now) and
+  -- a little more room at the bottom.
+  local MOVEBOX_H = 6 + 4*MOVE_ROW + 8
   local STATS_H = STAT_H*2 + GAP
-  local PARTY_PANEL_H = PAD + SPRITE_BOX + GAP + MOVEBOX_H + GAP + STATS_H + PAD
-  local ENEMY_SB_H = 230
-  local ENEMY_PANEL_H = PAD + ENEMY_SB_H + GAP + STATS_H + PAD
+  local PARTY_PANEL_H = PAD + INFO_H + GAP + MOVEBOX_H + GAP + STATS_H + PAD
+
+  -- Enemy panel is the compact layout: sprite sits beside the stat grid
+  -- instead of stacked above it, with no background box or badge strip of
+  -- its own anymore -- type badges and the status slot just sit on its
+  -- corners, so the sprite gets the full height to itself.
+  local ENEMY_STAT_H = 66
+  local ENEMY_STATS_H = ENEMY_STAT_H*2 + GAP
+  local ENEMY_SPRITE_W = ENEMY_STATS_H   -- square, fills the full height now
+  local ENEMY_PANEL_H = PAD + ENEMY_STATS_H + PAD
+  -- Calibrated by eye against your screenshot so both panels' TOPS line up
+  -- with the FIGHT/ITEM/RUN box's top -- nudge this if it's off once you
+  -- see it in-game; it's independent of either panel's height on purpose
+  -- so they don't just grow downward as they shrink. Shared by both sides
+  -- now that your panel is top-anchored the same way the enemy's is.
+  local PANEL_TOP_FROM_BOTTOM = 487
 
   local STAT_COL = {
     HP = hex("ff8a3d"), ATK = hex("ffd83d"), DEF = hex("6fe89a"),
@@ -595,77 +752,132 @@ return function(mod)
   }
   local BADGE_STAT_INDEX = { attack = 1, defense = 3, speed = 5, special = 7 }
 
-  local function stageBadge(x, y, w, h, stage)
+  local function stageBadge(x, y, w, h, stage, big)
     if not stage or stage == 0 then return end
-    local bw, bh = 40, 30
-    local bx, by = x + w - bw - 6, y + h - bh - 6
-    setc(COL.border, 1); rrect("fill", bx, by, bw, bh, 7)
+    -- Dark plate instead of a white/colored fill -- the raised/lowered
+    -- number itself carries the color now (green/red, same hpFull/hpLow
+    -- tones used elsewhere), with its usual black outline, so it pops off
+    -- the dark background instead of blending into a colored one.
+    local bw, bh, bx, by, fsz
+    if big then
+      -- Player side: still top-right, flush, bumped a bit bigger again.
+      bw, bh = 30, 25
+      bx, by = x + w - bw, y
+      fsz = 18
+    else
+      -- Enemy side: moved to top-right too, flush, to cleanly wrap around
+      -- the corner instead of hanging off the bottom.
+      bw, bh = 22, 19
+      bx, by = x + w - bw, y
+      fsz = 14
+    end
+    setc(COL.plate, 1); rrect("fill", bx, by, bw, bh, 6)
     love.graphics.setLineWidth(math.max(1, 1.6*s))
-    setc(COL.outline, 1); rrect("line", bx, by, bw, bh, 7)
-    local col = stage > 0 and {0.04, 0.43, 0.1} or {0.59, 0.06, 0.06}
-    txt((stage > 0 and "+" or "") .. tostring(stage), bx + bw/2, by + 5, 18, col, "center", 0.05)
+    setc(COL.outline, 1); rrect("line", bx, by, bw, bh, 6)
+    local col = stage > 0 and COL.hpFull or COL.hpLow
+    txtMid(tostring(math.abs(stage)), bx + bw/2, by + bh/2, fsz, col, "center")
   end
 
-  local function hpDot(cur, mx)
-    if not (cur and mx and mx > 0) then return nil end
-    if cur >= mx then return COL.hpFull end
-    if cur / mx >= 0.25 then return COL.hpHurt end
-    return COL.hpLow
-  end
-
-  local function statBox(x, y, w, h, label, value, col, stage, badgeIndex, dot)
+  local function statBox(x, y, w, h, label, value, col, stage, badgeIndex, dot, noLabel, speedArrow)
     setc(col, 1); rrect("fill", x, y, w, h, 10)
     love.graphics.setLineWidth(math.max(1, 2.8*s))
     setc(COL.border, 1); rrect("line", x, y, w, h, 10)
-    local lsz = 22
-    if dot then
-      local lw = textW(label, lsz)
-      local dsz = 21
-      local lx = x + w/2 - (lw + 8 + dsz)/2
-      txt(label, lx + dsz + 8, y + h*0.11, lsz, COL.text, nil, 0.10)
-      local cx2, cy2 = lx + dsz/2, y + h*0.11 + 3 + dsz/2
-      setc(dot, 1)
-      love.graphics.circle("fill", math.floor(cx2*s), math.floor(cy2*s), (dsz/2)*s, 24)
-      love.graphics.setLineWidth(math.max(1, 2.6*s))
-      setc(COL.outline, 1)
-      love.graphics.circle("line", math.floor(cx2*s), math.floor(cy2*s), (dsz/2)*s, 24)
+    -- Label row (when shown) and its accessory icon -- the HP dot, a
+    -- badge-boost icon, or the speed arrow -- all share this same inset
+    -- from the top, so every box's little marker lines up on one row.
+    local topY = y + 4
+    local iconSz = 22
+    if noLabel then
+      -- Enemy grid: no HP/ATK/DEF text (the player's grid teaches that
+      -- already), so the number gets the whole box, centered, and reads
+      -- bigger. Sized against a fixed "99" reference so every 1-2 digit
+      -- value lands at the SAME font size/outline weight -- no more a lone
+      -- digit reading thicker than a 2-digit value just because it needed
+      -- less shrinking. Only a genuinely wider value (triple digit, or a
+      -- decimal like CRIT's) drops to its own smaller, independently
+      -- thickened tier so it doesn't come out paper-thin.
+      -- Ratio bumped up from the box's earlier, taller size (0.3 at
+      -- h=92) to the same one here (h=66) -- shrinking the box shouldn't
+      -- have shrunk the font with it; this restores the same absolute
+      -- pixel size that was already legible.
+      local vszRef = h*0.42
+      while textW("99", vszRef) > w - 16 and vszRef > 16 do vszRef = vszRef - 1 end
+      local vsz, extraPx = vszRef, 1
+      if textW(value, vszRef) > w - 16 then
+        vsz = vszRef
+        while textW(value, vsz) > w - 16 and vsz > 16 do vsz = vsz - 1 end
+        extraPx = 3
+      end
+      txtMid(value, x + w/2, y + h/2, vsz, COL.text, "center", 0.07, extraPx)
     else
-      txt(label, x + w/2, y + h*0.11, lsz, COL.text, "center", 0.10)
+      local lsz = 22
+      -- Labels sit flat black with no outline -- they're already on a
+      -- light, solid pastel box, so the outline was just adding noise --
+      -- rather than white-on-color like the rest of this HUD. HP's colored
+      -- dot is gone -- it's a live number already, the dot was redundant.
+      txt(label, x + w/2, topY, lsz, COL.outline, "center", nil, nil, true)
+      -- Centered in the space below the label row (not pinned to a fixed
+      -- offset that pushes it toward the bottom) so it stays balanced
+      -- against the label above and the stage-modifier badge below.
+      -- Same fixed-reference sizing as the enemy grid: every 1-2 digit
+      -- value locks to one size/outline weight instead of drifting per
+      -- value, and it uses the same weight/extraPx as the enemy's normal
+      -- tier so both sides read at the same outline thickness.
+      local vszRef = h*0.38
+      while textW("99", vszRef) > w - 20 and vszRef > 16 do vszRef = vszRef - 1 end
+      local vsz, extraPx = vszRef, 1
+      if textW(value, vszRef) > w - 20 then
+        vsz = vszRef
+        while textW(value, vsz) > w - 20 and vsz > 16 do vsz = vsz - 1 end
+        extraPx = 3
+      end
+      local vmidY = (topY + iconSz + (y + h)) / 2
+      txtMid(value, x + w/2, vmidY, vsz, COL.text, "center", 0.07, extraPx)
     end
-    local vsz = h*0.42
-    while textW(value, vsz) > w - 20 and vsz > 16 do vsz = vsz - 1 end
-    txt(value, x + w/2, y + h*0.38, vsz, COL.text, "center")
-    stageBadge(x, y, w, h, stage)
+    stageBadge(x, y, w, h, stage, not noLabel)
     if badgeIndex then
-      -- Shows which badge is boosting this stat.
-      drawImg(uiImage(mod.assets:path("assets/badges/badge" .. badgeIndex .. "_true.png")), x + 6, y + 6, 26)
+      -- Shows which badge is boosting this stat. Lines up with the label
+      -- row's icon inset, top-left.
+      drawImg(uiImage(mod.assets:path("assets/badges/badge" .. badgeIndex .. "_true.png")), x + 6, topY, iconSz)
+    end
+    if speedArrow then
+      -- Only used on your own SPD box: up = you're faster, down = you're
+      -- not. A bit bigger than the badge-boost icon now that it's not
+      -- carrying a ring, so it's centered on the same row rather than
+      -- top-aligned with it.
+      local asz = iconSz + 4
+      speedBadge(speedArrow, x + w - 6 - asz, topY - (asz - iconSz)/2, asz)
     end
   end
 
-  local function statGrid(x, y, w, m, cols, showHPDot)
+  local function statGrid(x, y, w, m, cols, showHPDot, noLabel, speedArrow, rowH)
+    local rh = rowH or STAT_H
     local stats = (m and m.shown) or (m and m.stats) or {}
     local stages = (m and m.stages) or {}
     local badgeStat = (m and m.badgeStat) or {}
     local gapc = GAP
     local bw = (w - gapc*(cols-1)) / cols
     local critPct = m and m.baseSpeed and (m.baseSpeed / 512 * 100) or nil
-    local critStr = critPct and string.format("%.1f%%", critPct) or "--"
-    local dot = showHPDot and hpDot(m and m.hp, stats.hp) or nil
+    -- The label now says "CRIT %", so the number itself drops the percent
+    -- sign -- one less character buys the box real breathing room, and it
+    -- makes it obvious triple-digit stats (and any other value) still fit,
+    -- since it's the same box, same font logic, just fewer characters.
+    local critStr = critPct and string.format("%.1f", critPct) or "--"
     local hpVal = showHPDot and (m and m.hp) or stats.hp
     local rows = {
-      { "HP",   hpVal,          STAT_COL.HP,   stages.accuracy, nil, dot },
+      { "HP",   hpVal,          STAT_COL.HP,   stages.accuracy, nil },
       { "ATK",  stats.attack,   STAT_COL.ATK,  stages.attack,   badgeStat.attack and BADGE_STAT_INDEX.attack },
       { "DEF",  stats.defense,  STAT_COL.DEF,  stages.defense,  badgeStat.defense and BADGE_STAT_INDEX.defense },
       { "SPC",  stats.special,  STAT_COL.SPC,  stages.special,  badgeStat.special and BADGE_STAT_INDEX.special },
-      { "SPD",  stats.speed,    STAT_COL.SPD,  stages.speed,    badgeStat.speed and BADGE_STAT_INDEX.speed },
-      { "CRIT", critStr,        STAT_COL.CRIT, stages.evasion,  nil },
+      { "SPD",  stats.speed,    STAT_COL.SPD,  stages.speed,    badgeStat.speed and BADGE_STAT_INDEX.speed, nil, speedArrow },
+      { "CRIT %", critStr,      STAT_COL.CRIT, stages.evasion,  nil },
     }
     for i, e in ipairs(rows) do
       local cx = x + ((i-1) % cols) * (bw + gapc)
-      local cy = y + math.floor((i-1) / cols) * (STAT_H + gapc)
-      statBox(cx, cy, bw, STAT_H, e[1], tostring(e[2] or "--"), e[3], e[4], e[5], e[6])
+      local cy = y + math.floor((i-1) / cols) * (rh + gapc)
+      statBox(cx, cy, bw, rh, e[1], tostring(e[2] or "--"), e[3], e[4], e[5], e[6], noLabel, e[7])
     end
-    return STAT_H*2 + gapc
+    return rh*2 + gapc
   end
 
   -- Only shows your lead Pokemon, not the whole party.
@@ -676,41 +888,95 @@ return function(mod)
     panel(x, y, w, PARTY_PANEL_H, false)
     local iL, iW = x + PAD, w - PAD*2
 
-    local sbx, sby = iL, y + PAD
-    subbox(sbx, sby, SPRITE_BOX, SPRITE_BOX)
-    fitImg(getSprite(m.species, C.dPoke), sbx + 12, sby + 6, SPRITE_BOX - 24, SPRITE_BOX - 40, true)
-    statusIcons(m, sbx + 7, sby + SPRITE_BOX - 57, 42, false)
+    -- Header strip: sprite fills the whole row height (no background box,
+    -- just the outlined silhouette), types stacked beside it top-aligned,
+    -- name+level on one row, growth rate on its own row below, then the XP
+    -- bar (which leaves room on its row for a status icon, shown only when
+    -- something's actually active), then XP-to-next with the ability name
+    -- (also only when the mon actually has one) to its right.
+    local iy = y + PAD
+    local spriteX = iL - 6
+    fitImg(getSprite(m.species, C.dPoke), spriteX, iy, INFO_H, INFO_H, true, true,
+      getSpriteBounds(m.species, C.dPoke))
 
-    local bx = sbx + SPRITE_BOX + GAP
+    local typeSz = 28
+    local ttx = spriteX + INFO_H + 8
+    local tty = iy
+    for _, t in ipairs(m.types or {}) do
+      typeIcon(t, ttx, tty, typeSz)
+      tty = tty + typeSz + 4
+    end
+
+    local bx = ttx + typeSz + 10
     local bw = x + w - PAD - bx
-    txt(ellipsize(m.name, NAME_SIZE, bw), bx, sby - 2, NAME_SIZE)
+    -- Auto-shrinks to fit the FULL name -- never truncates -- reserving
+    -- only the actual width "Lv ##" needs (not a flat guess), so the name
+    -- gets as much of the row as it can.
+    local lvlStr = "Lv " .. (m.level or "?")
+    local lvlSz = 22
+    local nameMaxW = bw - textW(lvlStr, lvlSz) - 10
+    local nameSz = NAME_SIZE
+    while textW(m.name, nameSz) > nameMaxW and nameSz > 18 do nameSz = nameSz - 1 end
+    txt(m.name, bx, iy - 2, nameSz)
+    txt(lvlStr, x + w - PAD, iy + nameSz - lvlSz, lvlSz, COL.text, "right")
 
-    local ty, tsz = sby + 44, 48
-    local tx = bx
-    for _, t in ipairs(m.types or {}) do tx = tx + typeIcon(t, tx, ty, tsz) + 8 end
-    txtMid("Lv " .. (m.level or "?"), x + w - PAD, ty + tsz/2, 30, COL.text, "right")
+    local gy = iy + NAME_SIZE + 4
+    if m.growthRate then txt(titleCase(m.growthRate), bx, gy, 24) end
 
-    local gy = ty + tsz + 10
-    if m.growthRate then txt(titleCase(m.growthRate), bx, gy, 22) end
+    -- Big status slot, spanning roughly the growth-rate-to-XP-text block so
+    -- it can read at real size instead of being squeezed into just the
+    -- bar's own thin row. Still only drawn when something's actually
+    -- active (statusBox no-ops otherwise).
+    local statusSz = 44
+    local statusY = gy + 15
+
     if m.xpProgress ~= nil then
-      local xby = gy + 30
-      bar(bx, xby, bw, 12, m.xpProgress, COL.xp)
+      -- Growth rate -> bar: 12px gap, same as before. Bar itself is
+      -- thicker now, and its bottom edge lines up directly with the top of
+      -- the XP-to-next text below it -- no gap between them anymore.
+      local xby = gy + 24 + 12
+      local barH = 16
+      local barW = bw - statusSz - 10
+      xpBar(bx, xby, barW, barH, m.xpProgress)
+      statusBox(bx + barW + 10, statusY, statusSz, m)
+
       local lbl = (m.xpToNext and m.xpToNext > 0)
         and (money(m.xpToNext):gsub("\194\165","") .. " XP to Lv " .. ((m.level or 0)+1))
         or (((m.exp and money(m.exp):gsub("\194\165","")) or "0") .. " XP \194\183 Max")
-      txt(lbl, bx, xby + 20, 21)
+      local xty = xby + barH
+      txt(lbl, bx, xty, 20)
+      -- Ability: no permanent placeholder box or caption -- most Gen 1
+      -- species don't have one, so it only appears (right-aligned, next to
+      -- the XP-to-next text) when a mod actually gives the mon one, e.g.
+      -- Steam Engine on Coalossal. Shrinks to whatever room is actually
+      -- left after the XP-to-next text -- a long ability name next to a
+      -- long XP label was running the two into each other.
+      if m.ability then
+        local abilName = titleCase(m.ability)
+        local availW = (x + w - PAD) - (bx + textW(lbl, 20) + 10)
+        local abilSz = 22
+        while textW(abilName, abilSz) > availW and abilSz > 8 do abilSz = abilSz - 1 end
+        -- Bottom-aligned with the XP-to-next text (which sits at size 20)
+        -- rather than sharing its top -- so a shrunk ability name doesn't
+        -- look like it's floating above the line it's next to.
+        txt(abilName, x + w - PAD, xty + (20 - abilSz), abilSz, COL.gold, "right")
+      end
     end
 
-    local mby = y + PAD + SPRITE_BOX + GAP
+    local mby = y + PAD + INFO_H + GAP
     subbox(iL, mby, iW, MOVEBOX_H)
     local mL, mR = iL + 12, iL + iW - 12
+    local moveIconSz = 28
     local ppR = mR
-    local powR = ppR - 90
-    local nameL = mL + 42 + 12
-    local nameMax = powR - 58 - nameL
+    local accR = ppR - 40
+    -- Well clear of accuracy now, not just a few px off it -- "100" and
+    -- "100%" no longer come anywhere near touching.
+    local powR = accR - 80
+    local nameL = mL + moveIconSz + 8
+    local nameMax = powR - 46 - nameL
     for i = 1, 4 do
       local mv = m.moves and m.moves[i]
-      local ry = mby + 12 + (i-1)*MOVE_ROW
+      local ry = mby + 6 + (i-1)*MOVE_ROW
       local cy = ry + MOVE_ROW/2
       if mv then
         if mv.best then
@@ -718,24 +984,37 @@ return function(mod)
           love.graphics.setLineWidth(math.max(1, 1.8*s))
           setc(COL.bestLine, 1); rrect("line", mL - 4, ry + 2, (mR - mL) + 8, MOVE_ROW - 4, 8)
         end
-        if mv.type then typeIcon(mv.type, mL, cy - 21, 42) end
+        if mv.type then typeIcon(mv.type, mL, cy - moveIconSz/2, moveIconSz) end
         local pw = effPower(mv)
         local nm = mv.name .. ((pw and mv.stab) and " *" or "")
         txtMid(ellipsize(nm, MOVE_SIZE, nameMax), nameL, cy, MOVE_SIZE)
         txtMid(pw and tostring(pw) or "\226\128\148", powR, cy, MOVE_SIZE, COL.text, "right")
-        local pp = (mv.pp ~= nil and mv.maxpp ~= nil) and (mv.pp.."/"..mv.maxpp) or "--"
-        txtMid(pp, ppR, cy, 20, COL.text, "right")
+        local accStr = mv.accuracy and (tostring(mv.accuracy) .. "%") or "--"
+        txtMid(accStr, accR, cy, 17, COL.dim, "right")
+        -- Just the current count now, not "current/max" -- saves a lot of
+        -- horizontal room. Reads dark red once you're down to 3 PP or less.
+        local pp = mv.pp ~= nil and tostring(mv.pp) or "--"
+        local ppCol = (mv.pp ~= nil and mv.pp <= 3) and COL.hpLow or COL.text
+        txtMid(pp, ppR, cy, 20, ppCol, "right")
       else
         txtMid("\226\128\148", nameL, cy, MOVE_SIZE, COL.dim)
+        txtMid("\226\128\148", accR, cy, 17, COL.dim, "right")
         txtMid("\226\128\148", ppR, cy, 20, COL.dim, "right")
       end
     end
 
-    statGrid(iL, mby + MOVEBOX_H + GAP, iW, m, 3, true)
+    -- Speed arrow scrapped on your side -- it read too small next to the
+    -- stat-modifier badge, and freeing that corner lets the badge sit
+    -- there instead when speed itself is raised/lowered.
+    statGrid(iL, mby + MOVEBOX_H + GAP, iW, m, 3, true, false, nil)
     return PARTY_PANEL_H
   end
 
-  -- Enemy panel: sprite in its own box, icons in the gutters either side.
+  -- Enemy panel: stat grid and sprite box side by side. The sprite box is
+  -- a small square tucked in the bottom-right, with a strip above it (same
+  -- width) holding the type badge(s) and the speed badge, top-right
+  -- anchored. Labels are dropped from the grid (statGrid's noLabel) so the
+  -- numbers can run bigger in the smaller boxes.
   local function enemyPanel(st, x, y)
     local b = st.battle; if not b then return 0 end
     local en = b.enemy or {}
@@ -743,26 +1022,38 @@ return function(mod)
     panel(x, y, w, ENEMY_PANEL_H, false)
     local iL, iW = x + PAD, w - PAD*2
 
-    local hy = y + PAD
-    local sbw = 264
-    local sbx = iL + (iW - sbw)/2
-    subbox(sbx, hy, sbw, ENEMY_SB_H)
-    fitImg(getSprite(en.species, C.dPoke), sbx + 12, hy + 10, sbw - 24, ENEMY_SB_H - 20, false)
+    local gy = y + PAD
+    local sbw, sbh = ENEMY_SPRITE_W, ENEMY_SPRITE_W
+    local sbx = iL + iW - sbw
+    local statAreaW = sbx - iL - GAP
 
-    local isz = 56
-    local gl = iL + ((sbx - iL) - isz)/2
-    local ty = hy + 6
-    for _, t in ipairs(en.types or {}) do typeIcon(t, gl, ty, isz); ty = ty + isz + 8 end
+    -- No background box behind the sprite anymore -- just the outlined
+    -- silhouette, same treatment your own Pokemon now gets, filling the
+    -- full height freed up by dropping the badge strip above it.
+    fitImg(getSprite(en.species, C.dPoke), sbx + 4, gy + 4, sbw - 8, sbh - 8, false, true,
+      getSpriteBounds(en.species, C.dPoke))
 
-    local gr = sbx + sbw + ((iL + iW) - (sbx + sbw) - isz)/2
-    local arrow = b.faster == "you" and "faster" or (b.faster == "them" and "slower"
-      or (b.faster == "tie" and "tie" or nil))
-    if arrow then
-      drawImg(uiImage(mod.assets:path("assets/speed/" .. arrow .. ".png")), gr, hy + 6, isz)
+    -- Stat grid first: the type badges and status slot sit on the sprite's
+    -- corners and can overlap its edge, so they need to draw on top.
+    statGrid(iL, gy, statAreaW, en, 3, false, true, nil, ENEMY_STAT_H)
+
+    -- Type badge(s) anchored to the sprite's top-right corner: a single
+    -- type sits at the top, two stack with the primary on top.
+    local badgeSz = 36
+    -- Right up against the sprite box's top border (corner-badge look), and
+    -- when there are two types, stacked tight -- barely any gap between
+    -- them.
+    local tby = gy - 12
+    for _, t in ipairs(en.types or {}) do
+      typeIcon(t, sbx + sbw - badgeSz, tby, badgeSz)
+      tby = tby + badgeSz + 2
     end
 
-    statusIcons(en, sbx + sbw - 7, hy + ENEMY_SB_H - 57, 42, true)
-    statGrid(iL, hy + ENEMY_SB_H + GAP, iW, en, 3, false)
+    -- Status condition, bottom-right corner of the sprite -- same rule as
+    -- your own side: confusion overrides a lingering status for display.
+    local statusSz = 40
+    statusBox(sbx + sbw - statusSz, gy + sbh - statusSz, statusSz, en)
+
     return ENEMY_PANEL_H
   end
 
@@ -867,10 +1158,11 @@ return function(mod)
     end
 
     -- Bottom left: your Pokemon. Bottom right: the enemy, battle only. Both
-    -- sit on the same baseline so the stat grids line up across the screen.
-    party(st, edge, dh - edge - PARTY_PANEL_H)
+    -- are top-anchored now, lined up with the top of the game's own
+    -- FIGHT/ITEM/RUN box, instead of sitting bottom-flush.
+    party(st, edge, dh - PANEL_TOP_FROM_BOTTOM)
     if st.battle then
-      enemyPanel(st, dw - edge - COLW, dh - edge - ENEMY_PANEL_H)
+      enemyPanel(st, dw - edge - COLW, dh - PANEL_TOP_FROM_BOTTOM)
     end
     love.graphics.pop()
   end
